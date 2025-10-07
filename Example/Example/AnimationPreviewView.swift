@@ -110,18 +110,18 @@ struct AnimationPreviewView: View {
 
   // MARK: Private
 
-  /// Used for remote animations only, when more than one URL is provided we loop over the urls every 2 seconds.
-  private let timer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
-  private let urls: [URL]
-
   @State private var animationPlaying = true
   @State private var sliderValue: AnimationProgressTime = 0
   @State private var currentURLIndex: Int
-  @State private var renderingEngine: RenderingEngineOption = .automatic
-  @State private var loopMode: LottieLoopMode = .loop
+  @State private var renderingEngine = RenderingEngineOption.automatic
+  @State private var loopMode = LottieLoopMode.loop
   @State private var playFromProgress: AnimationProgressTime = 0
   @State private var playToProgress: AnimationProgressTime = 1
   @State private var currentRenderingEngine: RenderingEngine?
+
+  /// Used for remote animations only, when more than one URL is provided we loop over the urls every 2 seconds.
+  private let timer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
+  private let urls: [URL]
 
   private var playbackMode: LottiePlaybackMode {
     if animationPlaying {
@@ -137,7 +137,7 @@ struct AnimationPreviewView: View {
     Menu {
       Menu {
         option("Automatic", keyPath: \.renderingEngine, value: .automatic)
-        option("Core Animaiton", keyPath: \.renderingEngine, value: .coreAnimation)
+        option("Core Animation", keyPath: \.renderingEngine, value: .coreAnimation)
         option("Main Thread", keyPath: \.renderingEngine, value: .mainThread)
       } label: {
         Text("Rendering Engine")

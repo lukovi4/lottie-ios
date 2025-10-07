@@ -381,9 +381,9 @@ public class LottieAnimationLayer: CALayer {
 
       switch position {
       case .start:
-        currentTime = from.frameTime
+        currentFrame = from.frameTime
       case .end:
-        currentTime = from.frameTime + from.durationFrameTime
+        currentFrame = from.frameTime + from.durationFrameTime
       }
     }
 
@@ -638,7 +638,7 @@ public class LottieAnimationLayer: CALayer {
   }
 
   /// Sets the loop behavior for `play` calls. Defaults to `playOnce`
-  public var loopMode: LottieLoopMode = .playOnce {
+  public var loopMode = LottieLoopMode.playOnce {
     didSet {
       updateInFlightAnimation()
     }
@@ -852,6 +852,16 @@ public class LottieAnimationLayer: CALayer {
 
     valueProviders[keypath] = valueProvider
     animationLayer.setValueProvider(valueProvider, keypath: keypath)
+  }
+
+  public func removeValueProvider(for keypath: AnimationKeypath) {
+    guard let animationLayer = rootAnimationLayer else { return }
+
+    for valueProvider in valueProviders {
+      guard valueProvider.key.matches(keypath) else { continue }
+      valueProviders[valueProvider.key] = nil
+    }
+    animationLayer.removeValueProvider(for: keypath)
   }
 
   /// Reads the value of a property specified by the Keypath.

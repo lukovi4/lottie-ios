@@ -69,7 +69,7 @@ public enum LottieLoopMode: Hashable {
 // MARK: Equatable
 
 extension LottieLoopMode: Equatable {
-  public static func == (lhs: LottieLoopMode, rhs: LottieLoopMode) -> Bool {
+  public static func ==(lhs: LottieLoopMode, rhs: LottieLoopMode) -> Bool {
     switch (lhs, rhs) {
     case (.repeat(let lhsAmount), .repeat(let rhsAmount)),
          (.repeatBackwards(let lhsAmount), .repeatBackwards(let rhsAmount)):
@@ -678,8 +678,17 @@ open class LottieAnimationView: LottieAnimationViewBase {
     lottieAnimationLayer.setValueProvider(valueProvider, keypath: keypath)
   }
 
+  /// Sets a ValueProvider for the specified keypath. The value provider will be removed
+  /// on all properties that match the keypath.
+  public func removeValueProvider(for keypath: AnimationKeypath) {
+    lottieAnimationLayer.removeValueProvider(for: keypath)
+  }
+
   /// Reads the value of a property specified by the Keypath.
   /// Returns nil if no property is found.
+  ///
+  /// Note: This method isn't supported by the Core Animation rendering engine and will always return `nil` if used.
+  /// It is still supported by the Main Thread rendering engine.
   ///
   /// - Parameter for: The keypath used to search for the property.
   /// - Parameter atFrame: The Frame Time of the value to query. If nil then the current frame is used.
@@ -937,7 +946,7 @@ open class LottieAnimationView: LottieAnimationViewBase {
       }
     }
 
-    // UIView Animation does not implicitly set CAAnimation time or timing fuctions.
+    // UIView Animation does not implicitly set CAAnimation time or timing functions.
     // If layout is changed in an animation we must get the current animation duration
     // and timing function and then manually create a CAAnimation to match the UIView animation.
     // If layout is changed without animation, explicitly set animation duration to 0.0

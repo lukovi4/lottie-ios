@@ -424,9 +424,11 @@ extension CoreAnimationLayer: RootAnimationLayer {
   var respectAnimationFrameRate: Bool {
     get { false }
     set {
-      logger.assertionFailure("""
-        The Core Animation rendering engine currently doesn't support `respectAnimationFrameRate`)
-        """)
+      if newValue {
+        logger.assertionFailure("""
+          The Core Animation rendering engine currently doesn't support `respectAnimationFrameRate`)
+          """)
+      }
     }
   }
 
@@ -501,6 +503,14 @@ extension CoreAnimationLayer: RootAnimationLayer {
     valueProviderStore.setValueProvider(valueProvider, keypath: keypath)
 
     // We need to rebuild the current animation after registering a value provider,
+    // since any existing `CAAnimation`s could now be out of date.
+    rebuildCurrentAnimation()
+  }
+
+  func removeValueProvider(for keypath: AnimationKeypath) {
+    valueProviderStore.removeValueProvider(for: keypath)
+
+    // We need to rebuild the current animation after removing a value provider,
     // since any existing `CAAnimation`s could now be out of date.
     rebuildCurrentAnimation()
   }
@@ -594,7 +604,7 @@ extension CALayer {
     var numberOfSublayersWithTimeRemapping = 0
 
     for sublayer in sublayers ?? [] {
-      if 
+      if
         let preCompLayer = sublayer as? PreCompLayer,
         preCompLayer.preCompLayer.timeRemapping != nil
       {
