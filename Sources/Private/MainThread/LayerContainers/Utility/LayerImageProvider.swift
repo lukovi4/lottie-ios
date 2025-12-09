@@ -5,12 +5,9 @@
 //  Created by Brandon Withrow on 1/25/19.
 //
 
-//<<<<<<< HEAD
 import Foundation
 import UIKit
-//
-//=======
-//>>>>>>> master
+
 /// Connects a LottieImageProvider to a group of image layers
 final class LayerImageProvider {
 
@@ -47,7 +44,7 @@ final class LayerImageProvider {
     }
   }
 
-    func reloadImages(seconds: CGFloat?) {
+  func reloadImages(seconds: CGFloat?) {
     for imageLayer in imageLayers {
       if let asset = imageAssets[imageLayer.imageReferenceID] {
         imageLayer.image = imageProvider.imageForAsset(asset: asset, seconds: seconds)
