@@ -51,6 +51,7 @@ class CompositionLayer: CALayer, KeypathSearchable {
       "anchorPoint": NSNull(),
       "sublayerTransform": NSNull(),
       "hidden": NSNull(),
+      "contents": NSNull(),
     ]
     compositingFilter = layer.blendMode.filterName
     addSublayer(contentsLayer)
