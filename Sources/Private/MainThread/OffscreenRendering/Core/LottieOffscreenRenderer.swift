@@ -62,6 +62,7 @@ public final class LottieOffscreenRenderer {
     private var imageLayers: [ImageCompositionLayer] = []
 
     /// Flag to track if coordinate flip is needed
+    /// Note: When using renderImageLayers (direct CGContext drawing), we need flip for UIKit coords
     private let needsCoordinateFlip: Bool = true
 
     // MARK: - Metrics (for debugging/profiling)
@@ -184,11 +185,8 @@ public final class LottieOffscreenRenderer {
             ctx.flipCoordinateSystem(height: canvasSize.height)
         }
 
-        // 6. Render all layers using CALayer.render()
-        // This renders the complete layer tree, not just images
-        for layer in animationLayers {
-            layer.render(in: ctx)
-        }
+        // 6. Render image layers directly to CGContext (no CALayer.render!)
+        renderImageLayers(into: ctx)
 
         ctx.restoreGState()
 
@@ -199,8 +197,8 @@ public final class LottieOffscreenRenderer {
 
     // MARK: - Private Rendering Methods
 
-    /// Renders all image layers into the context.
-    /// MVP implementation - shapes/text/masks to be added later.
+    /// Renders all image layers directly into the CGContext.
+    /// This bypasses CALayer.render() completely for true offscreen rendering.
     private func renderImageLayers(into ctx: CGContext) {
         for layer in imageLayers {
             // Skip hidden layers
