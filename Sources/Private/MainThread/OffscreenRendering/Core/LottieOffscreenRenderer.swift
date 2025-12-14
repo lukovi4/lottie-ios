@@ -123,10 +123,8 @@ public final class LottieOffscreenRenderer {
         for layer in layers.reversed() {
             layer.bounds = CGRect(origin: .zero, size: canvasSize)
 
-            // Collect image layers for fast access
-            if let imageLayer = layer as? ImageCompositionLayer {
-                collectedImageLayers.append(imageLayer)
-            }
+            // Recursively collect image layers (they may be nested in PreCompositionLayer)
+            Self.collectImageLayers(from: layer, into: &collectedImageLayers)
 
             // Handle matte relationships
             if let matte = mattedLayer {
@@ -223,6 +221,25 @@ public final class LottieOffscreenRenderer {
             ctx.draw(image, in: bounds)
 
             ctx.restoreGState()
+        }
+    }
+
+    // MARK: - Layer Collection
+
+    /// Recursively collects all ImageCompositionLayer instances from the layer tree.
+    /// Image layers may be nested inside PreCompositionLayer or other container layers.
+    private static func collectImageLayers(from layer: CALayer, into result: inout [ImageCompositionLayer]) {
+        // Check if this layer is an ImageCompositionLayer
+        if let imageLayer = layer as? ImageCompositionLayer {
+            result.append(imageLayer)
+            print("🎬 [LottieOffscreenRenderer] Found ImageCompositionLayer: \(imageLayer.keypathName ?? "unknown")")
+        }
+
+        // Recursively search sublayers
+        if let sublayers = layer.sublayers {
+            for sublayer in sublayers {
+                collectImageLayers(from: sublayer, into: &result)
+            }
         }
     }
 
