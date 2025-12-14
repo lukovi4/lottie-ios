@@ -184,8 +184,11 @@ public final class LottieOffscreenRenderer {
             ctx.flipCoordinateSystem(height: canvasSize.height)
         }
 
-        // 6. Render layers (MVP: only ImageCompositionLayer)
-        renderImageLayers(into: ctx)
+        // 6. Render all layers using CALayer.render()
+        // This renders the complete layer tree, not just images
+        for layer in animationLayers {
+            layer.render(in: ctx)
+        }
 
         ctx.restoreGState()
 
