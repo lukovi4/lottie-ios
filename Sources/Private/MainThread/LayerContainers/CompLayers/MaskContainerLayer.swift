@@ -7,6 +7,28 @@
 
 import QuartzCore
 
+// MARK: - MaskSnapshot
+
+/// Snapshot of a resolved mask for the current frame.
+/// Used by LottieOffscreenRenderer to render masks without accessing private internals.
+public struct MaskSnapshot {
+    /// Final resolved CGPath ready for rendering.
+    /// Includes any inversion logic (veryLargeRect + evenOdd) already applied.
+    public let path: CGPath
+
+    /// The mask mode (add, subtract, intersect, etc.)
+    public let mode: MaskMode
+
+    /// Normalized opacity (0.0 - 1.0)
+    public let opacity: CGFloat
+
+    /// Whether the mask was marked as inverted in the source.
+    /// Note: The `path` already includes inversion logic, this is for diagnostics only.
+    public let inverted: Bool
+}
+
+// MARK: - MaskMode Extension
+
 extension MaskMode {
   var usableMode: MaskMode {
     switch self {
@@ -77,6 +99,30 @@ final class MaskContainerLayer: CALayer {
     }
   }
 
+  /// Returns resolved masks for the current frame.
+  ///
+  /// **Precondition:** `updateWithFrame()` must have been called for this frame.
+  /// In the standard pipeline, `CompositionLayer.displayWithFrame()` handles this.
+  ///
+  /// - Returns: Array of MaskSnapshot with final resolved paths and properties.
+  public func maskSnapshots() -> [MaskSnapshot] {
+    maskLayers.compactMap { layer -> MaskSnapshot? in
+      guard let props = layer.properties,
+            let path = layer.maskLayer.path else { return nil }
+
+      // Normalize opacity: Lottie stores as 0-100, we need 0-1
+      let rawOpacity = props.opacity.value.cgFloatValue
+      let normalizedOpacity = rawOpacity > 1 ? rawOpacity / 100.0 : rawOpacity
+
+      return MaskSnapshot(
+        path: path,
+        mode: props.mode,
+        opacity: normalizedOpacity,
+        inverted: props.inverted
+      )
+    }
+  }
+
   // MARK: Fileprivate
 
   fileprivate var maskLayers: [MaskLayer] = []
@@ -94,7 +140,9 @@ extension CGRect {
 
 // MARK: - MaskLayer
 
-private class MaskLayer: CALayer {
+/// Internal mask layer that holds the resolved path and properties.
+/// Changed from private to fileprivate for maskSnapshots() access.
+fileprivate class MaskLayer: CALayer {
 
   // MARK: Lifecycle
 
@@ -157,7 +205,9 @@ private class MaskLayer: CALayer {
 
 // MARK: - MaskNodeProperties
 
-private class MaskNodeProperties: NodePropertyMap {
+/// Properties for a single mask (opacity, shape, mode, etc.)
+/// Changed from private to fileprivate for maskSnapshots() access.
+fileprivate class MaskNodeProperties: NodePropertyMap {
 
   // MARK: Lifecycle
 
