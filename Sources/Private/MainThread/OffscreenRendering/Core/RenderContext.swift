@@ -94,3 +94,40 @@ public struct RenderContext {
         // blendMode will be applied when needed for masks/mattes
     }
 }
+
+// MARK: - OffscreenRenderable
+
+/// Protocol for renderers that support offscreen (export) rendering with explicit alpha management.
+///
+/// ## Why a Separate Protocol?
+/// The existing `Renderable.render(_ ctx: CGContext)` method relies on `ctx.alpha` getter
+/// which doesn't work correctly with bitmap contexts. This protocol provides an alternative
+/// entry point that receives `RenderContext` with explicit alpha tracking.
+///
+/// ## Implementation Pattern
+/// ```swift
+/// extension FillRenderer: OffscreenRenderable {
+///     func renderOffscreen(_ ctx: RenderContext) {
+///         guard let path = outputPath, let color = color else { return }
+///
+///         ctx.cg.saveGState()
+///         defer { ctx.cg.restoreGState() }
+///
+///         ctx.cg.addPath(path)
+///         ctx.cg.setFillColor(color)
+///         // Use ctx.state.alpha (layer-level) * self.opacity (paint-level)
+///         ctx.cg.setAlpha(ctx.state.alpha * opacity)
+///         ctx.cg.fillPath(using: fillRule.cgFillRule)
+///     }
+/// }
+/// ```
+///
+/// ## Key Difference from render(_ ctx: CGContext)
+/// - `render()` may call `ctx.alpha` which returns incorrect value (always 1.0)
+/// - `renderOffscreen()` uses `ctx.state.alpha` which is our tracked source of truth
+///
+public protocol OffscreenRenderable {
+    /// Renders content using explicit alpha from RenderContext.
+    /// - Parameter ctx: The render context with tracked alpha state
+    func renderOffscreen(_ ctx: RenderContext)
+}
