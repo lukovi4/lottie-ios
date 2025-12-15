@@ -78,3 +78,26 @@ final class FillRenderer: PassThroughOutputNode, Renderable {
   }
 
 }
+
+// MARK: - OffscreenRenderable
+
+extension FillRenderer: OffscreenRenderable {
+  /// Renders fill using explicit alpha from RenderContext.
+  /// Uses ctx.state.alpha (layer-level) * self.opacity (paint-level).
+  func renderOffscreen(_ ctx: RenderContext) {
+    guard let cgPath = outputPath else { return }
+    guard let fillColor = color else { return }
+    if cgPath.boundingBoxOfPath.isNull { return }
+
+    hasUpdate = false
+
+    ctx.cg.saveGState()
+    defer { ctx.cg.restoreGState() }
+
+    ctx.cg.addPath(cgPath)
+    ctx.cg.setFillColor(fillColor)
+    // Key difference: use ctx.state.alpha instead of ctx.cg.alpha
+    ctx.cg.setAlpha(ctx.state.alpha * opacity)
+    ctx.cg.fillPath(using: fillRule.cgFillRule)
+  }
+}

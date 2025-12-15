@@ -256,10 +256,16 @@ public final class LottieOffscreenRenderer {
     /// Each renderer receives RenderContext with accumulated layer-level alpha.
     /// Renderers multiply their paint-level opacity on top: `ctx.state.alpha * self.opacity`
     ///
-    /// ## Renderer Types
+    /// ## Renderer Types (all must conform to OffscreenRenderable)
     /// - FillRenderer, StrokeRenderer: Simple path operations
     /// - GradientFillRenderer, GradientStrokeRenderer: Complex gradient rendering
     /// - LegacyGradientFillRenderer: Used internally by GradientStrokeRenderer
+    ///
+    /// ## No Fallback Policy
+    /// We do NOT fall back to shapeRenderLayer.draw(in:) because:
+    /// 1. It uses ctx.alpha which doesn't work in bitmap contexts
+    /// 2. Mixing render paths would cause inconsistent alpha behavior
+    /// Non-migrated renderers are logged and skipped (fail-fast for debugging).
     ///
     private func renderShapeContainer(_ container: ShapeContainerLayer, ctx: RenderContext) {
         // Render in correct order (renderLayers are in Lottie's layer order)
@@ -279,16 +285,53 @@ public final class LottieOffscreenRenderer {
                     // Use OffscreenRenderable path - proper alpha from RenderState
                     offscreenRenderer.renderOffscreen(ctx)
                 } else {
-                    // Fallback for any renderer not yet migrated
-                    shapeRenderLayer.draw(in: ctx.cg)
+                    // NO FALLBACK: Log and skip non-migrated renderer
+                    // This makes migration gaps immediately visible during testing
+                    let rendererType = String(describing: type(of: shapeRenderLayer.renderer))
+                    logNonMigratedRenderer(rendererType)
+                    #if DEBUG
+                    assertionFailure("⚠️ [LottieOffscreenRenderer] Renderer '\(rendererType)' does not conform to OffscreenRenderable. Export will be incorrect.")
+                    #endif
                 }
             }
 
             ctx.cg.restoreGState()
 
-            // Recurse into nested containers
-            renderShapeContainer(renderLayer, ctx: ctx)
+            // Recurse into nested containers (safe type check)
+            if let childContainer = renderLayer as? ShapeContainerLayer {
+                renderShapeContainer(childContainer, ctx: ctx)
+            }
         }
+    }
+
+    // MARK: - Migration Audit
+
+    /// Tracks non-migrated renderer types encountered during export.
+    /// Reset at the start of each export, logged at the end.
+    private var nonMigratedRendererCounts: [String: Int] = [:]
+
+    /// Logs a non-migrated renderer type (called during render).
+    private func logNonMigratedRenderer(_ type: String) {
+        nonMigratedRendererCounts[type, default: 0] += 1
+    }
+
+    /// Resets the migration audit counters. Call at start of export.
+    public func resetMigrationAudit() {
+        nonMigratedRendererCounts.removeAll()
+    }
+
+    /// Logs migration audit results. Call at end of export.
+    public func logMigrationAudit() {
+        guard !nonMigratedRendererCounts.isEmpty else {
+            print("✅ [LottieOffscreenRenderer] All renderers migrated to OffscreenRenderable")
+            return
+        }
+
+        print("⚠️ [LottieOffscreenRenderer] Non-migrated renderers detected:")
+        for (type, count) in nonMigratedRendererCounts.sorted(by: { $0.value > $1.value }) {
+            print("   - \(type): \(count) occurrences")
+        }
+        print("   These renderers were SKIPPED and will cause incorrect export!")
     }
 
     // MARK: - Image Rendering
