@@ -130,7 +130,8 @@ final class PreCompositionLayer: CompositionLayer {
     }
   }
 
-  // MARK: Fileprivate
+  // MARK: Internal
 
-  fileprivate var animationLayers: [CompositionLayer]
+  /// Child animation layers for this precomp (exposed for offscreen rendering)
+  var animationLayers: [CompositionLayer]
 }

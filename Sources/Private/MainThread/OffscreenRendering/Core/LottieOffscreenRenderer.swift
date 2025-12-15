@@ -58,9 +58,6 @@ public final class LottieOffscreenRenderer {
     /// Provider for image/video frames (owned by this renderer)
     private let layerImageProvider: LayerImageProvider
 
-    /// All image layers extracted from the tree for fast access
-    private var imageLayers: [ImageCompositionLayer] = []
-
 
     // MARK: - Metrics (for debugging/profiling)
 
@@ -115,16 +112,12 @@ public final class LottieOffscreenRenderer {
             rootAnimationLayer: nil
         )
 
-        // Process layers: set up mattes, collect image layers
+        // Process layers: set up mattes
         var processedLayers: [CompositionLayer] = []
-        var collectedImageLayers: [ImageCompositionLayer] = []
         var mattedLayer: CompositionLayer? = nil
 
         for layer in layers.reversed() {
             layer.bounds = CGRect(origin: .zero, size: canvasSize)
-
-            // Recursively collect image layers (they may be nested in PreCompositionLayer)
-            Self.collectImageLayers(from: layer, into: &collectedImageLayers)
 
             // Handle matte relationships
             if let matte = mattedLayer {
@@ -141,15 +134,18 @@ public final class LottieOffscreenRenderer {
         }
 
         self.animationLayers = processedLayers
-        self.imageLayers = collectedImageLayers
 
-        // Register image layers with provider
+        // Collect image layers for provider registration (unified traversal will render them)
+        var collectedImageLayers: [ImageCompositionLayer] = []
+        for layer in processedLayers {
+            Self.collectImageLayers(from: layer, into: &collectedImageLayers)
+        }
         layerImageProvider.addImageLayers(collectedImageLayers)
 
         // Initial image load
         layerImageProvider.reloadImages(seconds: nil)
 
-        print("🎬 [LottieOffscreenRenderer] Created: size=\(canvasSize), fps=\(framerate), layers=\(animationLayers.count), imageLayers=\(imageLayers.count)")
+        print("🎬 [LottieOffscreenRenderer] Created: size=\(canvasSize), fps=\(framerate), layers=\(animationLayers.count), imageLayers=\(collectedImageLayers.count)")
     }
 
     // MARK: - Rendering
@@ -175,59 +171,107 @@ public final class LottieOffscreenRenderer {
             layer.displayWithFrame(frame: frame, forceUpdates: true)
         }
 
+        // 4. Render all layers in correct order (unified traversal)
         // CONTRACT: VideoGenerator provides context already flipped to UIKit coords (Y-down).
-        // All rendering (shapes AND images) uses the same coordinate system - no per-element flips.
-
-        // Render image layers directly to CGContext (no CALayer.render!)
-        renderImageLayers(into: ctx)
+        for layer in animationLayers {
+            renderCompositionLayer(layer, into: ctx)
+        }
 
         // Update metrics
         framesRendered += 1
         totalRenderTime += CACurrentMediaTime() - startTime
     }
 
-    // MARK: - Private Rendering Methods
+    // MARK: - Unified Layer Traversal
 
-    /// Renders all image layers directly into the CGContext.
-    /// This bypasses CALayer.render() completely for true offscreen rendering.
+    /// Renders a composition layer and its contents.
+    /// This is the unified traversal that handles all layer types in correct order.
+    ///
+    /// ## Layer Types:
+    /// - ImageCompositionLayer → draws image with pixel-buffer flip
+    /// - ShapeCompositionLayer → draws shapes via renderer pipeline
+    /// - PreCompositionLayer → recursively renders children
+    ///
+    private func renderCompositionLayer(_ layer: CompositionLayer, into ctx: CGContext) {
+        guard !layer.isHidden else { return }
+
+        ctx.saveGState()
+        defer { ctx.restoreGState() }
+
+        // 1. Apply global transform (position, scale, rotation, anchor, parent chain)
+        let transform = layer.transformNode.globalTransform.affineTransform
+        ctx.concatenate(transform)
+
+        // 2. Hierarchical opacity (MULTIPLY, not replace!)
+        ctx.setAlpha(ctx.alpha * CGFloat(layer.transformNode.opacity))
+
+        // 3. TODO: masks/mattes will be applied here later
+
+        // 4. Render based on layer type
+        if let shapeLayer = layer as? ShapeCompositionLayer {
+            renderShapeLayer(shapeLayer, into: ctx)
+        } else if let imageLayer = layer as? ImageCompositionLayer {
+            renderImageLayer(imageLayer, into: ctx)
+        } else if let precompLayer = layer as? PreCompositionLayer {
+            renderPrecompLayer(precompLayer, into: ctx)
+        }
+        // Other layer types (Text, Solid, etc.) can be added later
+
+        // DEBUG: Log first few frames
+        if framesRendered < 3 {
+            let typeName = String(describing: type(of: layer)).replacingOccurrences(of: "CompositionLayer", with: "")
+            print("🎬 [Layer] '\(layer.keypathName ?? "?")' (\(typeName))")
+        }
+    }
+
+    // MARK: - Shape Rendering
+
+    /// Renders a ShapeCompositionLayer by traversing its renderContainer.
+    private func renderShapeLayer(_ layer: ShapeCompositionLayer, into ctx: CGContext) {
+        guard let container = layer.renderContainer else { return }
+        renderShapeContainer(container, into: ctx)
+    }
+
+    /// Recursively renders a ShapeContainerLayer and its children.
+    /// Each ShapeRenderLayer.draw(in:) adds path and calls renderer.render(ctx).
+    private func renderShapeContainer(_ container: ShapeContainerLayer, into ctx: CGContext) {
+        // Render in correct order (renderLayers are in Lottie's layer order)
+        for renderLayer in container.renderLayers {
+            guard !renderLayer.isHidden else { continue }
+
+            ctx.saveGState()
+
+            // Apply layer's own transform if any
+            if !renderLayer.affineTransform().isIdentity {
+                ctx.concatenate(renderLayer.affineTransform())
+            }
+
+            // ShapeRenderLayer.draw(in:) adds outputPath and calls renderer.render(ctx)
+            if let shapeRenderLayer = renderLayer as? ShapeRenderLayer {
+                shapeRenderLayer.draw(in: ctx)
+            }
+
+            ctx.restoreGState()
+
+            // Recurse into nested containers
+            renderShapeContainer(renderLayer, into: ctx)
+        }
+    }
+
+    // MARK: - Image Rendering
+
+    /// Renders an ImageCompositionLayer with correct pixel-buffer orientation.
     ///
     /// ## Coordinate System Policy
     /// - Context is in UIKit coords (Y-down) from VideoGenerator
-    /// - globalTransform places the "slot" in world space
+    /// - globalTransform places the "slot" in world space (already applied)
     /// - Inside the slot, we flip Y for pixel-buffer images (origin bottom-left)
-    /// - This replicates CA's `contentsGravity = .resize` behavior
     ///
-    /// ## IMPORTANT: Masks/Mattes Rule
-    /// If applying mask/matte to an image, the clip MUST be in the same gState
-    /// where the flip is applied. Otherwise mask will be upside-down relative to pixels.
-    ///
-    private func renderImageLayers(into ctx: CGContext) {
-        for layer in imageLayers {
-            guard !layer.contentsLayer.isHidden else { continue }
-            guard let image = layer.image else { continue }
+    private func renderImageLayer(_ layer: ImageCompositionLayer, into ctx: CGContext) {
+        guard let image = layer.image else { return }
 
-            ctx.saveGState()
-            defer { ctx.restoreGState() }
-
-            // 1. Apply global transform (position, scale, rotation, anchor, parent chain)
-            let transform = layer.transformNode.globalTransform.affineTransform
-            ctx.concatenate(transform)
-
-            // 2. Hierarchical opacity
-            ctx.setAlpha(ctx.alpha * CGFloat(layer.transformNode.opacity))
-
-            // 3. TODO: If mask/matte for this layer exists, apply clip HERE (in world space)
-            //    or inside the flipped gState below if mask is relative to slot content
-
-            // 4. Draw image with local flip (pixel-buffer images have origin at bottom-left)
-            let bounds = layer.contentsLayer.bounds
-            drawPixelBufferImage(image, inSlot: bounds, ctx: ctx)
-
-            // DEBUG: Log first few frames
-            if framesRendered < 3 {
-                print("🖼️ [Image] '\(layer.keypathName ?? "?")': slot=\(bounds.size)")
-            }
-        }
+        let bounds = layer.contentsLayer.bounds
+        drawPixelBufferImage(image, inSlot: bounds, ctx: ctx)
     }
 
     /// Draws a CGImage from pixel buffer into a slot with correct orientation.
@@ -235,11 +279,6 @@ public final class LottieOffscreenRenderer {
     /// Pixel-buffer images (video frames, photos from CVPixelBuffer) have origin
     /// at bottom-left. This helper applies local Y-flip to draw correctly in
     /// UIKit coordinate context without copying pixels.
-    ///
-    /// - Parameters:
-    ///   - image: The CGImage to draw (from pixel buffer source)
-    ///   - bounds: The slot bounds (Lottie asset size, what globalTransform expects)
-    ///   - ctx: The CGContext to draw into
     ///
     /// - Note: If mask/matte applies to slot content, clip should be inside this flip.
     ///
@@ -249,6 +288,16 @@ public final class LottieOffscreenRenderer {
         ctx.scaleBy(x: 1, y: -1)
         ctx.draw(image, in: CGRect(origin: .zero, size: bounds.size))
         ctx.restoreGState()
+    }
+
+    // MARK: - Precomp Rendering
+
+    /// Renders a PreCompositionLayer by recursively rendering its children.
+    private func renderPrecompLayer(_ layer: PreCompositionLayer, into ctx: CGContext) {
+        // PreCompositionLayer has its own animationLayers
+        for childLayer in layer.animationLayers {
+            renderCompositionLayer(childLayer, into: ctx)
+        }
     }
 
     // MARK: - Layer Collection
