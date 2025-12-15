@@ -241,9 +241,9 @@ public final class LottieOffscreenRenderer {
 
     /// Renders a ShapeCompositionLayer by traversing its renderContainer.
     ///
-    /// NOTE: Currently uses ShapeRenderLayer.draw(in:) which internally calls
-    /// renderer.render(CGContext). In future, we may want to call renderers
-    /// directly with RenderContext for full control over alpha.
+    /// Uses OffscreenRenderable protocol on shape renderers for proper alpha handling.
+    /// Renderers receive RenderContext with explicit alpha state instead of relying
+    /// on CGContext.alpha getter (which doesn't work with bitmap contexts).
     ///
     private func renderShapeLayer(_ layer: ShapeCompositionLayer, ctx: RenderContext) {
         guard let container = layer.renderContainer else { return }
@@ -252,12 +252,14 @@ public final class LottieOffscreenRenderer {
 
     /// Recursively renders a ShapeContainerLayer and its children.
     ///
-    /// Shape renderers (Fill, Stroke, Gradient) currently use their own opacity
-    /// via ctx.setAlpha(ctx.alpha * self.opacity). Since we've already set
-    /// cg.setAlpha(layerState.alpha) in renderCompositionLayer, the multiplication
-    /// should work correctly for layer-level opacity.
+    /// ## Alpha Management
+    /// Each renderer receives RenderContext with accumulated layer-level alpha.
+    /// Renderers multiply their paint-level opacity on top: `ctx.state.alpha * self.opacity`
     ///
-    /// TODO: Migrate shape renderers to RenderContext for full control.
+    /// ## Renderer Types
+    /// - FillRenderer, StrokeRenderer: Simple path operations
+    /// - GradientFillRenderer, GradientStrokeRenderer: Complex gradient rendering
+    /// - LegacyGradientFillRenderer: Used internally by GradientStrokeRenderer
     ///
     private func renderShapeContainer(_ container: ShapeContainerLayer, ctx: RenderContext) {
         // Render in correct order (renderLayers are in Lottie's layer order)
@@ -271,10 +273,15 @@ public final class LottieOffscreenRenderer {
                 ctx.cg.concatenate(renderLayer.affineTransform())
             }
 
-            // ShapeRenderLayer.draw(in:) adds outputPath and calls renderer.render(ctx)
-            // NOTE: Renderers will multiply their opacity on top of current alpha
+            // Call renderOffscreen directly on renderer for proper alpha handling
             if let shapeRenderLayer = renderLayer as? ShapeRenderLayer {
-                shapeRenderLayer.draw(in: ctx.cg)
+                if let offscreenRenderer = shapeRenderLayer.renderer as? OffscreenRenderable {
+                    // Use OffscreenRenderable path - proper alpha from RenderState
+                    offscreenRenderer.renderOffscreen(ctx)
+                } else {
+                    // Fallback for any renderer not yet migrated
+                    shapeRenderLayer.draw(in: ctx.cg)
+                }
             }
 
             ctx.cg.restoreGState()

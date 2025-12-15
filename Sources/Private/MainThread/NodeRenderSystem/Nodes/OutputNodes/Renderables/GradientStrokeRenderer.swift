@@ -64,3 +64,28 @@ final class GradientStrokeRenderer: PassThroughOutputNode, Renderable {
   }
 
 }
+
+// MARK: - OffscreenRenderable
+
+extension GradientStrokeRenderer: OffscreenRenderable {
+  /// Renders gradient stroke using explicit alpha from RenderContext.
+  /// Delegates to strokeRender for stroke setup and gradientRender for gradient drawing.
+  func renderOffscreen(_ ctx: RenderContext) {
+    guard let cgPath = outputPath else { return }
+    if cgPath.boundingBoxOfPath.isNull { return }
+
+    strokeRender.hasUpdate = false
+    hasUpdate = false
+    gradientRender.hasUpdate = false
+
+    ctx.cg.saveGState()
+    defer { ctx.cg.restoreGState() }
+
+    ctx.cg.addPath(cgPath)
+    strokeRender.setupForStroke(ctx.cg)
+    ctx.cg.replacePathWithStrokedPath()
+
+    /// Now draw the gradient using offscreen renderer.
+    gradientRender.renderOffscreen(ctx)
+  }
+}

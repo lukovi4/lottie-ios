@@ -289,3 +289,45 @@ final class GradientFillRenderer: PassThroughOutputNode, Renderable {
   private let maskLayer = CAShapeLayer()
 
 }
+
+// MARK: - OffscreenRenderable
+
+extension GradientFillRenderer: OffscreenRenderable {
+  /// Renders gradient fill using explicit alpha from RenderContext.
+  /// Uses ctx.state.alpha (layer-level) * self.opacity (paint-level).
+  func renderOffscreen(_ ctx: RenderContext) {
+    guard let path = outputPath else { return }
+    if path.boundingBoxOfPath.isNull { return }
+
+    hasUpdate = false
+
+    // Sync anchor/bounds like updateShapeLayer() but for offscreen
+    let frame = path.boundingBox
+    let anchor = CGPoint(
+      x: frame.size.width == 0 ? 0 : -frame.origin.x / frame.size.width,
+      y: frame.size.height == 0 ? 0 : -frame.origin.y / frame.size.height
+    )
+
+    gradientLayer.bounds = frame
+    gradientLayer.anchorPoint = anchor
+
+    gradientLayer.start = start
+    gradientLayer.end = end
+    gradientLayer.numberOfColors = numberOfColors
+    gradientLayer.colors = colors
+    gradientLayer.type = type
+
+    ctx.cg.saveGState()
+    defer { ctx.cg.restoreGState() }
+
+    // Key difference: use ctx.state.alpha instead of ctx.cg.alpha
+    ctx.cg.setAlpha(ctx.state.alpha * opacity)
+
+    // Clip by path with fillRule
+    ctx.cg.addPath(path)
+    ctx.cg.clip(using: fillRule.cgFillRule)
+
+    // Draw gradient using existing implementation
+    gradientLayer.draw(in: ctx.cg)
+  }
+}
