@@ -58,6 +58,8 @@ public final class LottieOffscreenRenderer {
     /// Provider for image/video frames (owned by this renderer)
     private let layerImageProvider: LayerImageProvider
 
+    /// Pool of reusable CGContext buffers for mask rendering
+    private let contextPool = ContextPool()
 
     // MARK: - Metrics (for debugging/profiling)
 
@@ -224,17 +226,174 @@ public final class LottieOffscreenRenderer {
         // 4. Create RenderContext for this layer
         let renderCtx = RenderContext(cg: cg, state: layerState)
 
-        // 5. TODO: masks/mattes will be applied here later
+        // 5. Check for masks - if present, use alpha-mask rendering
+        if let maskContainer = layer.maskLayer {
+            let masks = maskContainer.maskSnapshots()
+            if !masks.isEmpty {
+                renderLayerWithMask(layer, masks: masks, into: cg, state: layerState)
+                return
+            }
+        }
 
-        // 6. Render based on layer type
+        // 6. Render based on layer type (no mask)
+        renderLayerContent(layer, ctx: renderCtx)
+    }
+
+    /// Renders layer content based on its type.
+    /// Extracted for reuse in both masked and non-masked paths.
+    private func renderLayerContent(_ layer: CompositionLayer, ctx: RenderContext) {
         if let shapeLayer = layer as? ShapeCompositionLayer {
-            renderShapeLayer(shapeLayer, ctx: renderCtx)
+            renderShapeLayer(shapeLayer, ctx: ctx)
         } else if let imageLayer = layer as? ImageCompositionLayer {
-            renderImageLayer(imageLayer, ctx: renderCtx)
+            renderImageLayer(imageLayer, ctx: ctx)
         } else if let precompLayer = layer as? PreCompositionLayer {
-            renderPrecompLayer(precompLayer, ctx: renderCtx)
+            renderPrecompLayer(precompLayer, ctx: ctx)
         }
         // Other layer types (Text, Solid, etc.) can be added later
+    }
+
+    // MARK: - Mask Rendering
+
+    /// Renders a layer with alpha mask applied.
+    ///
+    /// ## Algorithm:
+    /// 1. Calculate cropRect = intersection of content bounds and mask bounds
+    /// 2. Render content into RGBA offscreen buffer (cropRect size)
+    /// 3. Render masks into grayscale buffer (white * opacity)
+    /// 4. Composite: clip(to: cropRect, mask: grayImage) + draw(rgbaImage)
+    ///
+    /// ## Performance:
+    /// - Uses ContextPool to reuse buffers
+    /// - Bounds cropping avoids rendering full canvas for small masks
+    ///
+    /// ## Important:
+    /// This method is called AFTER globalTransform is already applied to main context.
+    /// Content and mask are rendered in layer's LOCAL coordinate space (before transform).
+    /// The final composite is drawn into the already-transformed main context.
+    ///
+    private func renderLayerWithMask(
+        _ layer: CompositionLayer,
+        masks: [MaskSnapshot],
+        into cg: CGContext,
+        state: RenderState
+    ) {
+        // 1. Calculate crop bounds in layer's LOCAL space (content ∩ masks)
+        // contentBounds and mask paths are in local coords
+        let contentBounds = layer.contentsLayer.bounds
+        let maskBounds = calculateMaskBounds(masks)
+        var cropRect = contentBounds.intersection(maskBounds)
+
+        // Guard against empty or invalid rect
+        if cropRect.isNull || cropRect.isEmpty || cropRect.width < 1 || cropRect.height < 1 {
+            // Mask doesn't intersect content - nothing to render
+            return
+        }
+
+        // Add small padding for anti-aliasing
+        cropRect = cropRect.insetBy(dx: -2, dy: -2)
+
+        let width = Int(ceil(cropRect.width))
+        let height = Int(ceil(cropRect.height))
+
+        // 2. Get buffers from pool
+        guard let contentCtx = contextPool.getRGBA(width: width, height: height),
+              let maskCtx = contextPool.getGrayscale(width: width, height: height) else {
+            // Fallback: render without mask if we can't get buffers
+            print("⚠️ [LottieOffscreenRenderer] Failed to get context buffers for mask, rendering without mask")
+            let renderCtx = RenderContext(cg: cg, state: state)
+            renderLayerContent(layer, ctx: renderCtx)
+            return
+        }
+
+        defer {
+            contextPool.release(contentCtx)
+            contextPool.release(maskCtx)
+        }
+
+        // 3. Setup content context with offset for crop
+        // We render in layer's local space, offset by cropRect origin
+        contentCtx.translateBy(x: -cropRect.origin.x, y: -cropRect.origin.y)
+
+        // 4. Render layer content into RGBA buffer
+        // Create RenderContext with alpha=1.0 for offscreen, we'll apply layer alpha when compositing
+        let offscreenState = RenderState(alpha: 1.0)
+        let contentRenderCtx = RenderContext(cg: contentCtx, state: offscreenState)
+        renderLayerContent(layer, ctx: contentRenderCtx)
+
+        // 5. Render masks into grayscale buffer
+        maskCtx.translateBy(x: -cropRect.origin.x, y: -cropRect.origin.y)
+        renderMasksToGrayscale(masks, into: maskCtx)
+
+        // 6. Get images from buffers
+        guard let contentImage = contentCtx.makeImage(),
+              let maskImage = maskCtx.makeImage() else {
+            print("⚠️ [LottieOffscreenRenderer] Failed to create images from mask buffers")
+            return
+        }
+
+        // 7. Composite onto main context
+        // Main context already has globalTransform applied, so we draw at cropRect origin
+        // in local coords. clip(to:mask:) uses mask alpha to determine visibility.
+        // Apply layer alpha when drawing the composited result.
+        cg.saveGState()
+        cg.setAlpha(state.alpha)
+        let destRect = CGRect(x: cropRect.origin.x, y: cropRect.origin.y, width: CGFloat(width), height: CGFloat(height))
+        cg.clip(to: destRect, mask: maskImage)
+        cg.draw(contentImage, in: destRect)
+        cg.restoreGState()
+    }
+
+    /// Calculates the bounding box of all masks combined.
+    private func calculateMaskBounds(_ masks: [MaskSnapshot]) -> CGRect {
+        var bounds = CGRect.null
+        for mask in masks {
+            let pathBounds = mask.path.boundingBox
+            if !pathBounds.isNull {
+                bounds = bounds.union(pathBounds)
+            }
+        }
+        return bounds
+    }
+
+    /// Renders masks into a grayscale context.
+    /// White (1.0) = fully visible, Black (0.0) = fully masked.
+    ///
+    /// For Add mode: fill path with white * opacity
+    /// Multiple Add masks are combined (union).
+    ///
+    private func renderMasksToGrayscale(_ masks: [MaskSnapshot], into ctx: CGContext) {
+        // Start with black (fully masked)
+        ctx.setFillColor(gray: 0, alpha: 1)
+        ctx.fill(CGRect(x: -10_000_000, y: -10_000_000, width: 20_000_000, height: 20_000_000))
+
+        // Render each mask
+        for mask in masks {
+            switch mask.mode {
+            case .add:
+                // Add mode: fill with white * opacity
+                ctx.setFillColor(gray: 1, alpha: mask.opacity)
+                ctx.addPath(mask.path)
+                ctx.fillPath(using: .evenOdd)
+
+            case .subtract:
+                // Subtract: path already contains veryLargeRect with evenOdd
+                // Fill with black to subtract
+                ctx.setFillColor(gray: 0, alpha: mask.opacity)
+                ctx.addPath(mask.path)
+                ctx.fillPath(using: .evenOdd)
+
+            case .intersect:
+                // Intersect: more complex, would need separate buffer
+                // For now, treat as add (covers most cases in MinCircles)
+                ctx.setFillColor(gray: 1, alpha: mask.opacity)
+                ctx.addPath(mask.path)
+                ctx.fillPath(using: .evenOdd)
+
+            default:
+                // Other modes (lighten, darken, difference, none) - skip
+                break
+            }
+        }
     }
 
     // MARK: - Shape Rendering
@@ -425,6 +584,12 @@ public final class LottieOffscreenRenderer {
         print("   Frames rendered: \(framesRendered)")
         print("   Total time: \(String(format: "%.2f", totalRenderTime))s")
         print("   Avg frame time: \(String(format: "%.2f", averageFrameTimeMs))ms")
+        contextPool.logStats()
+    }
+
+    /// Clears cached resources. Call after export completes.
+    public func clearCaches() {
+        contextPool.clear()
     }
 }
 

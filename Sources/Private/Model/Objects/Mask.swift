@@ -7,7 +7,9 @@
 
 // MARK: - MaskMode
 
-enum MaskMode: String, Codable {
+/// Mode for mask compositing.
+/// Public for use by MaskSnapshot in LottieOffscreenRenderer.
+public enum MaskMode: String, Codable {
   case add = "a"
   case subtract = "s"
   case intersect = "i"
