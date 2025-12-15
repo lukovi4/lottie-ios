@@ -40,21 +40,23 @@ final class GradientStrokeRenderer: PassThroughOutputNode, Renderable {
     /// Not Applicable
   }
 
-  func render(_ inContext: CGContext) {
-    guard inContext.path != nil, inContext.path!.isEmpty == false else {
-      return
-    }
+  func render(_ ctx: CGContext) {
+    guard let cgPath = outputPath else { return }
+    if cgPath.boundingBoxOfPath.isNull { return }
 
     strokeRender.hasUpdate = false
     hasUpdate = false
     gradientRender.hasUpdate = false
 
-    strokeRender.setupForStroke(inContext)
+    ctx.saveGState()
+    defer { ctx.restoreGState() }
 
-    inContext.replacePathWithStrokedPath()
+    ctx.addPath(cgPath)
+    strokeRender.setupForStroke(ctx)
+    ctx.replacePathWithStrokedPath()
 
     /// Now draw the gradient.
-    gradientRender.render(inContext)
+    gradientRender.render(ctx)
   }
 
   func renderBoundsFor(_ boundingBox: CGRect) -> CGRect {

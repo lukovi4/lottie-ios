@@ -12,6 +12,19 @@ import QuartzCore
 
 extension CGContext {
 
+    // MARK: - Alpha Tracking
+
+    /// Returns the current global alpha value.
+    /// Note: CGContext doesn't expose this directly, so we use a workaround.
+    /// This assumes alpha was set via setAlpha() and not modified by other means.
+    /// Default is 1.0 if not explicitly set.
+    var alpha: CGFloat {
+        // CGContext stores alpha internally but doesn't expose it.
+        // We can't read it directly, so for now we return 1.0.
+        // TODO: For true hierarchical opacity, track alpha in a RenderState object.
+        1.0
+    }
+
     // MARK: - Coordinate System
 
     /// Flips the coordinate system from CoreGraphics (origin bottom-left)
@@ -64,5 +77,38 @@ extension CATransform3D {
     /// Checks if the transform is 2D-only (no 3D rotation or perspective).
     var isAffine: Bool {
         CATransform3DIsAffine(self)
+    }
+}
+
+// MARK: - CGImage Extensions
+
+extension CGImage {
+
+    /// Creates a vertically flipped copy of the image.
+    /// This converts from CGImage coords (origin bottom-left) to UIKit coords (origin top-left).
+    ///
+    /// Use this when drawing CGImages in a UIKit-flipped context to avoid per-draw flips.
+    /// Flipping at source maintains a single coordinate system for shapes AND images.
+    func flippedVertically() -> CGImage? {
+        let width = self.width
+        let height = self.height
+
+        guard let colorSpace = self.colorSpace else { return nil }
+
+        guard let ctx = CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: bitsPerComponent,
+            bytesPerRow: 0,
+            space: colorSpace,
+            bitmapInfo: bitmapInfo.rawValue
+        ) else { return nil }
+
+        ctx.translateBy(x: 0, y: CGFloat(height))
+        ctx.scaleBy(x: 1, y: -1)
+        ctx.draw(self, in: CGRect(x: 0, y: 0, width: width, height: height))
+
+        return ctx.makeImage()
     }
 }

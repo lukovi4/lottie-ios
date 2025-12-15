@@ -138,16 +138,22 @@ final class StrokeRenderer: PassThroughOutputNode, Renderable {
     }
   }
 
-  func render(_ inContext: CGContext) {
-    guard inContext.path != nil, inContext.path!.isEmpty == false else {
-      return
-    }
-    guard let color else { return }
+  func render(_ ctx: CGContext) {
+    guard let cgPath = outputPath else { return }
+    guard let strokeColor = color else { return }
+    if cgPath.boundingBoxOfPath.isNull { return }
+
     hasUpdate = false
-    setupForStroke(inContext)
-    inContext.setAlpha(opacity)
-    inContext.setStrokeColor(color)
-    inContext.strokePath()
+
+    ctx.saveGState()
+    defer { ctx.restoreGState() }
+
+    ctx.addPath(cgPath)
+    setupForStroke(ctx)
+
+    ctx.setAlpha(ctx.alpha * opacity)
+    ctx.setStrokeColor(strokeColor)
+    ctx.strokePath()
   }
 
   func updateShapeLayer(layer: CAShapeLayer) {

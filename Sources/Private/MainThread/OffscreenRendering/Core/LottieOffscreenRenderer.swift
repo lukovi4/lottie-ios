@@ -61,9 +61,6 @@ public final class LottieOffscreenRenderer {
     /// All image layers extracted from the tree for fast access
     private var imageLayers: [ImageCompositionLayer] = []
 
-    /// Flag to track if coordinate flip is needed
-    /// Note: When using renderImageLayers (direct CGContext drawing), we need flip for UIKit coords
-    private let needsCoordinateFlip: Bool = true
 
     // MARK: - Metrics (for debugging/profiling)
 
@@ -93,9 +90,14 @@ public final class LottieOffscreenRenderer {
         self.canvasSize = animation.bounds.size
         self.framerate = CGFloat(animation.framerate)
 
+        // Wrap provider with FlippedImageProvider for UIKit-coords CGContext rendering.
+        // This flips images at source (not per-draw) to maintain ONE coordinate system
+        // for both shapes AND images, critical for masks/mattes compatibility.
+        let flippedProvider = FlippedImageProvider(wrapping: imageProvider)
+
         // Create our own LayerImageProvider (not shared with preview)
         self.layerImageProvider = LayerImageProvider(
-            imageProvider: imageProvider,
+            imageProvider: flippedProvider,
             assets: animation.assetLibrary?.imageAssets
         )
 
@@ -176,19 +178,11 @@ public final class LottieOffscreenRenderer {
             layer.displayWithFrame(frame: frame, forceUpdates: true)
         }
 
-        // 4. Clear context with copy blend mode (safer than .clear)
-        ctx.clearWithCopyBlendMode(CGRect(origin: .zero, size: canvasSize))
+        // CONTRACT: VideoGenerator provides context already flipped to UIKit coords (Y-down).
+        // All rendering (shapes AND images) uses the same coordinate system - no per-element flips.
 
-        // 5. Set up coordinate system (flip for UIKit compatibility)
-        ctx.saveGState()
-        if needsCoordinateFlip {
-            ctx.flipCoordinateSystem(height: canvasSize.height)
-        }
-
-        // 6. Render image layers directly to CGContext (no CALayer.render!)
+        // Render image layers directly to CGContext (no CALayer.render!)
         renderImageLayers(into: ctx)
-
-        ctx.restoreGState()
 
         // Update metrics
         framesRendered += 1
@@ -199,29 +193,32 @@ public final class LottieOffscreenRenderer {
 
     /// Renders all image layers directly into the CGContext.
     /// This bypasses CALayer.render() completely for true offscreen rendering.
+    ///
+    /// CONTRACT: Context is already in UIKit coords (Y-down) from VideoGenerator.
+    /// Both shapes and images use the same CTM - no per-element coordinate flips.
     private func renderImageLayers(into ctx: CGContext) {
         for layer in imageLayers {
-            // Skip hidden layers
             guard !layer.contentsLayer.isHidden else { continue }
-
-            // Skip layers without images
             guard let image = layer.image else { continue }
 
             ctx.saveGState()
+            defer { ctx.restoreGState() }
 
-            // Apply global transform (includes position, scale, rotation, anchor)
+            // Apply global transform (position, scale, rotation, anchor, parent chain)
             let transform = layer.transformNode.globalTransform.affineTransform
             ctx.concatenate(transform)
 
-            // Apply opacity
-            ctx.setAlpha(CGFloat(layer.transformNode.opacity))
+            // Hierarchical opacity
+            ctx.setAlpha(ctx.alpha * CGFloat(layer.transformNode.opacity))
 
-            // Draw the image
-            // Note: bounds from contentsLayer, not the layer itself
+            // Draw image - same coordinate system as shapes
             let bounds = layer.contentsLayer.bounds
             ctx.draw(image, in: bounds)
 
-            ctx.restoreGState()
+            // DEBUG: Log first few frames to verify transforms
+            if framesRendered < 3 {
+                print("🖼️ [Image] '\(layer.keypathName ?? "?")': bounds=\(bounds), transform=\(transform)")
+            }
         }
     }
 
@@ -230,13 +227,10 @@ public final class LottieOffscreenRenderer {
     /// Recursively collects all ImageCompositionLayer instances from the layer tree.
     /// Image layers may be nested inside PreCompositionLayer or other container layers.
     private static func collectImageLayers(from layer: CALayer, into result: inout [ImageCompositionLayer]) {
-        // Check if this layer is an ImageCompositionLayer
         if let imageLayer = layer as? ImageCompositionLayer {
             result.append(imageLayer)
-            print("🎬 [LottieOffscreenRenderer] Found ImageCompositionLayer: \(imageLayer.keypathName ?? "unknown")")
         }
 
-        // Recursively search sublayers
         if let sublayers = layer.sublayers {
             for sublayer in sublayers {
                 collectImageLayers(from: sublayer, into: &result)

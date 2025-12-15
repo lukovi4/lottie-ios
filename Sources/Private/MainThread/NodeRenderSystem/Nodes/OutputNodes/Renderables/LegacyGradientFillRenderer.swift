@@ -86,7 +86,7 @@ final class LegacyGradientFillRenderer: PassThroughOutputNode, Renderable {
       alphaColors.append(.gray(alpha))
     }
 
-    inContext.setAlpha(opacity)
+    inContext.setAlpha(inContext.alpha * opacity)
     inContext.clip()
 
     /// First draw a mask is necessary.

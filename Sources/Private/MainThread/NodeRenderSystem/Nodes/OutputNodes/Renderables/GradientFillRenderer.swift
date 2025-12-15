@@ -7,6 +7,19 @@
 
 import QuartzCore
 
+// MARK: - CAShapeLayerFillRule Extension
+
+extension CAShapeLayerFillRule {
+  var cgFillRule: CGPathFillRule {
+    switch self {
+    case .evenOdd:
+      return .evenOdd
+    default:
+      return .winding
+    }
+  }
+}
+
 // MARK: - GradientFillLayer
 
 private final class GradientFillLayer: CALayer {
@@ -202,8 +215,40 @@ final class GradientFillRenderer: PassThroughOutputNode, Renderable {
     set { maskLayer.fillRule = newValue }
   }
 
-  func render(_: CGContext) {
-    // do nothing
+  func render(_ ctx: CGContext) {
+    guard let path = outputPath else { return }
+    if path.boundingBoxOfPath.isNull { return }
+
+    hasUpdate = false
+
+    // Sync anchor/bounds like updateShapeLayer() but for offscreen
+    let frame = path.boundingBox
+    let anchor = CGPoint(
+      x: frame.size.width == 0 ? 0 : -frame.origin.x / frame.size.width,
+      y: frame.size.height == 0 ? 0 : -frame.origin.y / frame.size.height
+    )
+
+    gradientLayer.bounds = frame
+    gradientLayer.anchorPoint = anchor
+
+    gradientLayer.start = start
+    gradientLayer.end = end
+    gradientLayer.numberOfColors = numberOfColors
+    gradientLayer.colors = colors
+    gradientLayer.type = type
+
+    ctx.saveGState()
+    defer { ctx.restoreGState() }
+
+    // Hierarchical opacity (fill-level)
+    ctx.setAlpha(ctx.alpha * opacity)
+
+    // Clip by path with fillRule
+    ctx.addPath(path)
+    ctx.clip(using: fillRule.cgFillRule)
+
+    // Draw gradient using existing implementation
+    gradientLayer.draw(in: ctx)
   }
 
   func setupSublayers(layer: CAShapeLayer) {
@@ -240,7 +285,7 @@ final class GradientFillRenderer: PassThroughOutputNode, Renderable {
 
   // MARK: Private
 
-  private let gradientLayer = GradientFillLayer()
+  fileprivate let gradientLayer = GradientFillLayer()
   private let maskLayer = CAShapeLayer()
 
 }

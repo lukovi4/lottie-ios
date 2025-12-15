@@ -51,8 +51,19 @@ final class FillRenderer: PassThroughOutputNode, Renderable {
     }
   }
 
-  func render(_: CGContext) {
-    // do nothing
+  func render(_ ctx: CGContext) {
+    guard let cgPath = outputPath else { return }
+    guard let fillColor = color else { return }
+    if cgPath.boundingBoxOfPath.isNull { return }
+
+    hasUpdate = false
+
+    ctx.saveGState()
+    ctx.addPath(cgPath)
+    ctx.setFillColor(fillColor)
+    ctx.setAlpha(ctx.alpha * opacity)
+    ctx.fillPath(using: fillRule.cgFillRule)
+    ctx.restoreGState()
   }
 
   func setupSublayers(layer _: CAShapeLayer) {
