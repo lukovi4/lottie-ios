@@ -392,18 +392,14 @@ public final class LottieOffscreenRenderer {
         let maskBounds = calculateMaskBounds(masks)
         var cropRect = contentBounds.intersection(maskBounds)
 
-        #if DEBUG
-        print("🎭 [Mask] renderLayerWithMask '\(layer.keypathName ?? "?")'")
-        print("   contentBounds: \(contentBounds)")
-        print("   maskBounds: \(maskBounds)")
-        print("   cropRect: \(cropRect)")
-        #endif
-
         // Guard against empty or invalid rect
         if cropRect.isNull || cropRect.isEmpty || cropRect.width < 1 || cropRect.height < 1 {
             // Mask doesn't intersect content - nothing to render
             #if DEBUG
-            print("   ⚠️ cropRect invalid, skipping mask render")
+            print("   ⚠️ cropRect invalid for '\(layer.keypathName ?? "?")':")
+            print("      contentBounds: \(contentBounds) (null=\(contentBounds.isNull), empty=\(contentBounds.isEmpty))")
+            print("      maskBounds: \(maskBounds) (null=\(maskBounds.isNull), empty=\(maskBounds.isEmpty))")
+            print("      cropRect: \(cropRect)")
             #endif
             return
         }
