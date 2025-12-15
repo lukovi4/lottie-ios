@@ -229,6 +229,11 @@ public final class LottieOffscreenRenderer {
         // 5. Check for masks - if present, use alpha-mask rendering
         if let maskContainer = layer.maskLayer {
             let masks = maskContainer.maskSnapshots()
+            #if DEBUG
+            if !masks.isEmpty {
+                print("🎭 [Mask] layer='\(layer.keypathName ?? "?")' masks=\(masks.count) modes=\(masks.map { "\($0.mode)" })")
+            }
+            #endif
             if !masks.isEmpty {
                 renderLayerWithMask(layer, masks: masks, into: cg, state: layerState)
                 return
@@ -387,9 +392,19 @@ public final class LottieOffscreenRenderer {
         let maskBounds = calculateMaskBounds(masks)
         var cropRect = contentBounds.intersection(maskBounds)
 
+        #if DEBUG
+        print("🎭 [Mask] renderLayerWithMask '\(layer.keypathName ?? "?")'")
+        print("   contentBounds: \(contentBounds)")
+        print("   maskBounds: \(maskBounds)")
+        print("   cropRect: \(cropRect)")
+        #endif
+
         // Guard against empty or invalid rect
         if cropRect.isNull || cropRect.isEmpty || cropRect.width < 1 || cropRect.height < 1 {
             // Mask doesn't intersect content - nothing to render
+            #if DEBUG
+            print("   ⚠️ cropRect invalid, skipping mask render")
+            #endif
             return
         }
 
@@ -398,6 +413,10 @@ public final class LottieOffscreenRenderer {
 
         let width = Int(cropRect.width)
         let height = Int(cropRect.height)
+
+        #if DEBUG
+        print("   final cropRect: \(cropRect) (\(width)x\(height))")
+        #endif
 
         // 2. Get buffers from pool
         guard let contentCtx = contextPool.getRGBA(width: width, height: height),
