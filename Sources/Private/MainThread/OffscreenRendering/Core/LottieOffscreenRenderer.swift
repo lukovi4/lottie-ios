@@ -232,6 +232,8 @@ public final class LottieOffscreenRenderer {
             #if DEBUG
             if !masks.isEmpty {
                 print("🎭 [Mask] layer='\(layer.keypathName ?? "?")' masks=\(masks.count) modes=\(masks.map { "\($0.mode)" })")
+            } else {
+                print("⚠️ [Mask] layer='\(layer.keypathName ?? "?")' has maskContainer but masks.isEmpty!")
             }
             #endif
             if !masks.isEmpty {
@@ -241,6 +243,11 @@ public final class LottieOffscreenRenderer {
         }
 
         // 6. Render based on layer type (no mask)
+        #if DEBUG
+        if layer.keypathName?.contains("Media") == true {
+            print("🔴 [NO MASK] rendering '\(layer.keypathName ?? "?")' WITHOUT mask!")
+        }
+        #endif
         renderLayerContent(layer, ctx: renderCtx)
     }
 
@@ -396,10 +403,9 @@ public final class LottieOffscreenRenderer {
         if cropRect.isNull || cropRect.isEmpty || cropRect.width < 1 || cropRect.height < 1 {
             // Mask doesn't intersect content - nothing to render
             #if DEBUG
-            print("   ⚠️ cropRect invalid for '\(layer.keypathName ?? "?")':")
-            print("      contentBounds: \(contentBounds) (null=\(contentBounds.isNull), empty=\(contentBounds.isEmpty))")
-            print("      maskBounds: \(maskBounds) (null=\(maskBounds.isNull), empty=\(maskBounds.isEmpty))")
-            print("      cropRect: \(cropRect)")
+            print("   ⚠️ SKIP render - cropRect invalid for '\(layer.keypathName ?? "?")'")
+            print("      contentBounds: \(contentBounds)")
+            print("      maskBounds: \(maskBounds)")
             #endif
             return
         }
