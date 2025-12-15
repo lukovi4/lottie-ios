@@ -288,35 +288,62 @@ public final class LottieOffscreenRenderer {
         return layer.bounds
     }
 
-    /// Shape layer bounds = union of all outputPath.boundingBoxOfPath.
-    /// This gives the actual rendered area, not the CA layer bounds.
+    /// Shape layer bounds = union of all outputPath.boundingBoxOfPath with transforms applied.
+    /// This gives the actual rendered area, matching how shapes are drawn in renderShapeContainer.
     private func computeShapeLocalBounds(_ layer: ShapeCompositionLayer) -> CGRect {
-        guard let container = layer.renderContainer else {
-            return layer.contentsLayer.bounds
-        }
         var unionBounds = CGRect.null
-        accumulateShapeBounds(container, into: &unionBounds)
+        accumulateShapeBounds(layer.renderContainer, into: &unionBounds)
 
         // If we got valid bounds, use them; otherwise fall back to contentsLayer
         if !unionBounds.isNull && !unionBounds.isEmpty {
             return unionBounds
         }
-        return layer.contentsLayer.bounds
+        let b = layer.contentsLayer.bounds
+        return b.isEmpty ? layer.bounds : b
     }
 
-    /// Recursively accumulates bounds from all shape renderers in the container.
-    private func accumulateShapeBounds(_ container: ShapeContainerLayer, into rect: inout CGRect) {
+    // MARK: - Shape Bounds (transform-aware)
+
+    /// Entry point for shape bounds accumulation.
+    /// Starts with identity transform and recursively accumulates all shape bounds.
+    private func accumulateShapeBounds(_ container: ShapeContainerLayer?, into rect: inout CGRect) {
+        guard let container else { return }
+        accumulateShapeBounds(container, parentTransform: .identity, into: &rect)
+    }
+
+    /// Recursively accumulates bounds from all shape renderers in the container,
+    /// applying transforms as we go (matching renderShapeContainer traversal).
+    ///
+    /// This is critical for correct bounds calculation because:
+    /// - renderShapeContainer applies renderLayer.affineTransform() before drawing
+    /// - Without this, bounds would be in local renderer coords, not layer coords
+    /// - Result: cropRect too small/offset → clipped or misaligned masks
+    ///
+    private func accumulateShapeBounds(
+        _ container: ShapeContainerLayer,
+        parentTransform: CGAffineTransform,
+        into rect: inout CGRect
+    ) {
         for renderLayer in container.renderLayers {
+            // This must match rendering traversal:
+            // you concatenate renderLayer.affineTransform() before drawing.
+            let currentTransform = parentTransform.concatenating(renderLayer.affineTransform())
+
             if let shapeRenderLayer = renderLayer as? ShapeRenderLayer,
                let path = shapeRenderLayer.renderer.outputPath {
                 let pathBounds = path.boundingBoxOfPath
                 if !pathBounds.isNull && !pathBounds.isEmpty {
-                    rect = rect.isNull ? pathBounds : rect.union(pathBounds)
+                    // Apply accumulated transform to bounds (same as rendering CTM).
+                    let transformedBounds = pathBounds.applying(currentTransform)
+                    if !transformedBounds.isNull && !transformedBounds.isEmpty {
+                        rect = rect.isNull ? transformedBounds : rect.union(transformedBounds)
+                    }
                 }
             }
-            // Recurse into nested containers
+
+            // Recurse into nested containers with accumulated transform
             if let childContainer = renderLayer as? ShapeContainerLayer {
-                accumulateShapeBounds(childContainer, into: &rect)
+                accumulateShapeBounds(childContainer, parentTransform: currentTransform, into: &rect)
             }
         }
     }
@@ -421,12 +448,14 @@ public final class LottieOffscreenRenderer {
     }
 
     /// Calculates the bounding box of all masks combined.
+    /// Uses boundingBoxOfPath (actual curve bbox) instead of boundingBox (control points bbox)
+    /// for more accurate cropping.
     private func calculateMaskBounds(_ masks: [MaskSnapshot]) -> CGRect {
         var bounds = CGRect.null
         for mask in masks {
-            let pathBounds = mask.path.boundingBox
-            if !pathBounds.isNull {
-                bounds = bounds.union(pathBounds)
+            let pathBounds = mask.path.boundingBoxOfPath
+            if !pathBounds.isNull && !pathBounds.isEmpty {
+                bounds = bounds.isNull ? pathBounds : bounds.union(pathBounds)
             }
         }
         return bounds
