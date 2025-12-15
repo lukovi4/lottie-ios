@@ -146,6 +146,10 @@ public final class LottieOffscreenRenderer {
         layerImageProvider.reloadImages(seconds: nil)
 
         print("🎬 [LottieOffscreenRenderer] Created: size=\(canvasSize), fps=\(framerate), layers=\(animationLayers.count), imageLayers=\(collectedImageLayers.count)")
+        for (i, layer) in animationLayers.enumerated() {
+            let typeName = String(describing: type(of: layer)).replacingOccurrences(of: "CompositionLayer", with: "")
+            print("🎬 [LottieOffscreenRenderer]   [\(i)] '\(layer.keypathName ?? "?")' (\(typeName))")
+        }
     }
 
     // MARK: - Rendering
@@ -173,8 +177,11 @@ public final class LottieOffscreenRenderer {
 
         // 4. Render all layers in correct order (unified traversal)
         // CONTRACT: VideoGenerator provides context already flipped to UIKit coords (Y-down).
+        // NOTE: We use RenderState to track alpha because CGContext.alpha getter
+        // doesn't work correctly with bitmap contexts.
+        let initialState = RenderState.identity
         for layer in animationLayers {
-            renderCompositionLayer(layer, into: ctx)
+            renderCompositionLayer(layer, into: ctx, state: initialState)
         }
 
         // Update metrics
@@ -192,69 +199,88 @@ public final class LottieOffscreenRenderer {
     /// - ShapeCompositionLayer → draws shapes via renderer pipeline
     /// - PreCompositionLayer → recursively renders children
     ///
-    private func renderCompositionLayer(_ layer: CompositionLayer, into ctx: CGContext) {
+    /// ## Alpha Management
+    /// We use RenderState to track accumulated alpha, NOT CGContext.alpha getter
+    /// (which doesn't work correctly with bitmap contexts).
+    ///
+    private func renderCompositionLayer(_ layer: CompositionLayer, into cg: CGContext, state: RenderState) {
         guard !layer.isHidden else { return }
 
-        ctx.saveGState()
-        defer { ctx.restoreGState() }
+        cg.saveGState()
+        defer { cg.restoreGState() }
 
         // 1. Apply global transform (position, scale, rotation, anchor, parent chain)
         let transform = layer.transformNode.globalTransform.affineTransform
-        ctx.concatenate(transform)
+        cg.concatenate(transform)
 
-        // 2. Hierarchical opacity (MULTIPLY, not replace!)
-        ctx.setAlpha(ctx.alpha * CGFloat(layer.transformNode.opacity))
+        // 2. Calculate layer alpha from RenderState (our source of truth)
+        // NEVER read from cg.alpha - it doesn't work with bitmap contexts!
+        let layerOpacity = CGFloat(layer.transformNode.opacity)
+        let layerState = state.withOpacity(layerOpacity)
 
-        // 3. TODO: masks/mattes will be applied here later
+        // 3. Set alpha ABSOLUTE from our tracked state
+        cg.setAlpha(layerState.alpha)
 
-        // 4. Render based on layer type
+        // 4. Create RenderContext for this layer
+        let renderCtx = RenderContext(cg: cg, state: layerState)
+
+        // 5. TODO: masks/mattes will be applied here later
+
+        // 6. Render based on layer type
         if let shapeLayer = layer as? ShapeCompositionLayer {
-            renderShapeLayer(shapeLayer, into: ctx)
+            renderShapeLayer(shapeLayer, ctx: renderCtx)
         } else if let imageLayer = layer as? ImageCompositionLayer {
-            renderImageLayer(imageLayer, into: ctx)
+            renderImageLayer(imageLayer, ctx: renderCtx)
         } else if let precompLayer = layer as? PreCompositionLayer {
-            renderPrecompLayer(precompLayer, into: ctx)
+            renderPrecompLayer(precompLayer, ctx: renderCtx)
         }
         // Other layer types (Text, Solid, etc.) can be added later
-
-        // DEBUG: Log first few frames
-        if framesRendered < 3 {
-            let typeName = String(describing: type(of: layer)).replacingOccurrences(of: "CompositionLayer", with: "")
-            print("🎬 [Layer] '\(layer.keypathName ?? "?")' (\(typeName))")
-        }
     }
 
     // MARK: - Shape Rendering
 
     /// Renders a ShapeCompositionLayer by traversing its renderContainer.
-    private func renderShapeLayer(_ layer: ShapeCompositionLayer, into ctx: CGContext) {
+    ///
+    /// NOTE: Currently uses ShapeRenderLayer.draw(in:) which internally calls
+    /// renderer.render(CGContext). In future, we may want to call renderers
+    /// directly with RenderContext for full control over alpha.
+    ///
+    private func renderShapeLayer(_ layer: ShapeCompositionLayer, ctx: RenderContext) {
         guard let container = layer.renderContainer else { return }
-        renderShapeContainer(container, into: ctx)
+        renderShapeContainer(container, ctx: ctx)
     }
 
     /// Recursively renders a ShapeContainerLayer and its children.
-    /// Each ShapeRenderLayer.draw(in:) adds path and calls renderer.render(ctx).
-    private func renderShapeContainer(_ container: ShapeContainerLayer, into ctx: CGContext) {
+    ///
+    /// Shape renderers (Fill, Stroke, Gradient) currently use their own opacity
+    /// via ctx.setAlpha(ctx.alpha * self.opacity). Since we've already set
+    /// cg.setAlpha(layerState.alpha) in renderCompositionLayer, the multiplication
+    /// should work correctly for layer-level opacity.
+    ///
+    /// TODO: Migrate shape renderers to RenderContext for full control.
+    ///
+    private func renderShapeContainer(_ container: ShapeContainerLayer, ctx: RenderContext) {
         // Render in correct order (renderLayers are in Lottie's layer order)
         for renderLayer in container.renderLayers {
             guard !renderLayer.isHidden else { continue }
 
-            ctx.saveGState()
+            ctx.cg.saveGState()
 
             // Apply layer's own transform if any
             if !renderLayer.affineTransform().isIdentity {
-                ctx.concatenate(renderLayer.affineTransform())
+                ctx.cg.concatenate(renderLayer.affineTransform())
             }
 
             // ShapeRenderLayer.draw(in:) adds outputPath and calls renderer.render(ctx)
+            // NOTE: Renderers will multiply their opacity on top of current alpha
             if let shapeRenderLayer = renderLayer as? ShapeRenderLayer {
-                shapeRenderLayer.draw(in: ctx)
+                shapeRenderLayer.draw(in: ctx.cg)
             }
 
-            ctx.restoreGState()
+            ctx.cg.restoreGState()
 
             // Recurse into nested containers
-            renderShapeContainer(renderLayer, into: ctx)
+            renderShapeContainer(renderLayer, ctx: ctx)
         }
     }
 
@@ -267,7 +293,11 @@ public final class LottieOffscreenRenderer {
     /// - globalTransform places the "slot" in world space (already applied)
     /// - Inside the slot, we flip Y for pixel-buffer images (origin bottom-left)
     ///
-    private func renderImageLayer(_ layer: ImageCompositionLayer, into ctx: CGContext) {
+    /// ## Alpha
+    /// Alpha is already set in renderCompositionLayer via cg.setAlpha(layerState.alpha).
+    /// Images don't have their own opacity property, so we just use the inherited alpha.
+    ///
+    private func renderImageLayer(_ layer: ImageCompositionLayer, ctx: RenderContext) {
         guard let image = layer.image else { return }
 
         let bounds = layer.contentsLayer.bounds
@@ -280,23 +310,38 @@ public final class LottieOffscreenRenderer {
     /// at bottom-left. This helper applies local Y-flip to draw correctly in
     /// UIKit coordinate context without copying pixels.
     ///
+    /// - Note: Alpha is already set in CGContext from RenderState before this call.
     /// - Note: If mask/matte applies to slot content, clip should be inside this flip.
     ///
-    private func drawPixelBufferImage(_ image: CGImage, inSlot bounds: CGRect, ctx: CGContext) {
-        ctx.saveGState()
-        ctx.translateBy(x: 0, y: bounds.height)
-        ctx.scaleBy(x: 1, y: -1)
-        ctx.draw(image, in: CGRect(origin: .zero, size: bounds.size))
-        ctx.restoreGState()
+    private func drawPixelBufferImage(_ image: CGImage, inSlot bounds: CGRect, ctx: RenderContext) {
+        ctx.cg.saveGState()
+        defer { ctx.cg.restoreGState() }
+
+        // Alpha is already set from RenderState in renderCompositionLayer
+        // No need to set it again here
+
+        // Apply local Y-flip for pixel-buffer images
+        ctx.cg.translateBy(x: 0, y: bounds.height)
+        ctx.cg.scaleBy(x: 1, y: -1)
+        ctx.cg.draw(image, in: CGRect(origin: .zero, size: bounds.size))
     }
 
     // MARK: - Precomp Rendering
 
     /// Renders a PreCompositionLayer by recursively rendering its children.
-    private func renderPrecompLayer(_ layer: PreCompositionLayer, into ctx: CGContext) {
+    ///
+    /// ## Alpha Inheritance
+    /// Children receive the PreComp's accumulated alpha via RenderState.
+    /// This is the key mechanism for hierarchical opacity to work correctly.
+    ///
+    /// Example: If PreComp has opacity=0.5 and child Image has opacity=1.0,
+    /// the child will be rendered with alpha = 0.5 * 1.0 = 0.5
+    ///
+    private func renderPrecompLayer(_ layer: PreCompositionLayer, ctx: RenderContext) {
         // PreCompositionLayer has its own animationLayers
+        // Pass current RenderState.state so children inherit accumulated alpha
         for childLayer in layer.animationLayers {
-            renderCompositionLayer(childLayer, into: ctx)
+            renderCompositionLayer(childLayer, into: ctx.cg, state: ctx.state)
         }
     }
 
