@@ -195,8 +195,8 @@ public final class LottieOffscreenRenderer {
     /// Both shapes and images use the same CTM - no per-element coordinate flips.
     ///
     /// IMAGE FLIP: CGImage pixel data has origin at bottom-left, but we're in UIKit coords.
-    /// Instead of copying pixels (expensive!), we flip via geometry using negative height rect.
-    /// This is fast and keeps everything in ONE coordinate system for masks/mattes compatibility.
+    /// We use negative height rect with ACTUAL IMAGE SIZE (not CA layer bounds).
+    /// This is fast (no pixel copying) and independent of CALayer internals.
     private func renderImageLayers(into ctx: CGContext) {
         for layer in imageLayers {
             guard !layer.contentsLayer.isHidden else { continue }
@@ -212,16 +212,18 @@ public final class LottieOffscreenRenderer {
             // Hierarchical opacity
             ctx.setAlpha(ctx.alpha * CGFloat(layer.transformNode.opacity))
 
-            // Draw image with NEGATIVE HEIGHT to flip without copying pixels.
-            // This works because CGContext.draw() interprets negative height as Y-flip.
-            // The rect is in local layer coordinates (after globalTransform is applied).
-            let bounds = layer.contentsLayer.bounds
-            let flipRect = CGRect(x: 0, y: bounds.height, width: bounds.width, height: -bounds.height)
+            // Draw image using ACTUAL IMAGE DIMENSIONS (not contentsLayer.bounds!)
+            // contentsLayer.bounds is a CA detail that doesn't apply in offscreen context.
+            // Using image.width/height gives correct local rect independent of CA mechanics.
+            let w = CGFloat(image.width)
+            let h = CGFloat(image.height)
+            let flipRect = CGRect(x: 0, y: h, width: w, height: -h)
             ctx.draw(image, in: flipRect)
 
-            // DEBUG: Log first few frames to verify transforms
+            // DEBUG: Log first few frames - compare bounds vs actual image size
             if framesRendered < 3 {
-                print("🖼️ [Image] '\(layer.keypathName ?? "?")': bounds=\(bounds), transform=\(transform)")
+                let bounds = layer.contentsLayer.bounds
+                print("🖼️ [Image] '\(layer.keypathName ?? "?")': bounds=\(bounds.size) vs image=\(w)x\(h), transform=\(transform)")
             }
         }
     }
