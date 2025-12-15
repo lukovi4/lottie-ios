@@ -90,14 +90,11 @@ public final class LottieOffscreenRenderer {
         self.canvasSize = animation.bounds.size
         self.framerate = CGFloat(animation.framerate)
 
-        // Wrap provider with FlippedImageProvider for UIKit-coords CGContext rendering.
-        // This flips images at source (not per-draw) to maintain ONE coordinate system
-        // for both shapes AND images, critical for masks/mattes compatibility.
-        let flippedProvider = FlippedImageProvider(wrapping: imageProvider)
-
         // Create our own LayerImageProvider (not shared with preview)
+        // Note: We do NOT wrap with FlippedImageProvider here - that would copy pixels
+        // on every video frame (expensive!). Instead, we flip via geometry in draw rect.
         self.layerImageProvider = LayerImageProvider(
-            imageProvider: flippedProvider,
+            imageProvider: imageProvider,
             assets: animation.assetLibrary?.imageAssets
         )
 
@@ -196,6 +193,10 @@ public final class LottieOffscreenRenderer {
     ///
     /// CONTRACT: Context is already in UIKit coords (Y-down) from VideoGenerator.
     /// Both shapes and images use the same CTM - no per-element coordinate flips.
+    ///
+    /// IMAGE FLIP: CGImage pixel data has origin at bottom-left, but we're in UIKit coords.
+    /// Instead of copying pixels (expensive!), we flip via geometry using negative height rect.
+    /// This is fast and keeps everything in ONE coordinate system for masks/mattes compatibility.
     private func renderImageLayers(into ctx: CGContext) {
         for layer in imageLayers {
             guard !layer.contentsLayer.isHidden else { continue }
@@ -211,9 +212,12 @@ public final class LottieOffscreenRenderer {
             // Hierarchical opacity
             ctx.setAlpha(ctx.alpha * CGFloat(layer.transformNode.opacity))
 
-            // Draw image - same coordinate system as shapes
+            // Draw image with NEGATIVE HEIGHT to flip without copying pixels.
+            // This works because CGContext.draw() interprets negative height as Y-flip.
+            // The rect is in local layer coordinates (after globalTransform is applied).
             let bounds = layer.contentsLayer.bounds
-            ctx.draw(image, in: bounds)
+            let flipRect = CGRect(x: 0, y: bounds.height, width: bounds.width, height: -bounds.height)
+            ctx.draw(image, in: flipRect)
 
             // DEBUG: Log first few frames to verify transforms
             if framesRendered < 3 {
