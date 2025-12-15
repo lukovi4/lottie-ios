@@ -252,6 +252,84 @@ public final class LottieOffscreenRenderer {
         // Other layer types (Text, Solid, etc.) can be added later
     }
 
+    // MARK: - Bounds Calculation
+
+    /// Computes the actual content bounds for a layer in its LOCAL coordinate space.
+    ///
+    /// This is critical for correct mask cropping. Using `contentsLayer.bounds` directly
+    /// can be incorrect because:
+    /// - Shape layers: real bounds = union of outputPath.boundingBoxOfPath
+    /// - Precomp: bounds = union of children (with their transforms)
+    /// - Image: slot bounds (usually matches contentsLayer.bounds)
+    ///
+    /// Called during render (after displayWithFrame), not at init time.
+    ///
+    private func computeLayerLocalContentBounds(_ layer: CompositionLayer) -> CGRect {
+        if let imageLayer = layer as? ImageCompositionLayer {
+            return computeImageLocalBounds(imageLayer)
+        }
+        if let shapeLayer = layer as? ShapeCompositionLayer {
+            return computeShapeLocalBounds(shapeLayer)
+        }
+        if let precompLayer = layer as? PreCompositionLayer {
+            return computePrecompLocalBounds(precompLayer)
+        }
+
+        // Fallback for other layer types
+        let b = layer.contentsLayer.bounds
+        return b.isEmpty ? layer.bounds : b
+    }
+
+    /// Image layer bounds = slot bounds (not actual image size).
+    /// Transforms are calculated relative to slot, not image dimensions.
+    private func computeImageLocalBounds(_ layer: ImageCompositionLayer) -> CGRect {
+        let b = layer.contentsLayer.bounds
+        if !b.isEmpty { return b }
+        return layer.bounds
+    }
+
+    /// Shape layer bounds = union of all outputPath.boundingBoxOfPath.
+    /// This gives the actual rendered area, not the CA layer bounds.
+    private func computeShapeLocalBounds(_ layer: ShapeCompositionLayer) -> CGRect {
+        guard let container = layer.renderContainer else {
+            return layer.contentsLayer.bounds
+        }
+        var unionBounds = CGRect.null
+        accumulateShapeBounds(container, into: &unionBounds)
+
+        // If we got valid bounds, use them; otherwise fall back to contentsLayer
+        if !unionBounds.isNull && !unionBounds.isEmpty {
+            return unionBounds
+        }
+        return layer.contentsLayer.bounds
+    }
+
+    /// Recursively accumulates bounds from all shape renderers in the container.
+    private func accumulateShapeBounds(_ container: ShapeContainerLayer, into rect: inout CGRect) {
+        for renderLayer in container.renderLayers {
+            if let shapeRenderLayer = renderLayer as? ShapeRenderLayer,
+               let path = shapeRenderLayer.renderer.outputPath {
+                let pathBounds = path.boundingBoxOfPath
+                if !pathBounds.isNull && !pathBounds.isEmpty {
+                    rect = rect.isNull ? pathBounds : rect.union(pathBounds)
+                }
+            }
+            // Recurse into nested containers
+            if let childContainer = renderLayer as? ShapeContainerLayer {
+                accumulateShapeBounds(childContainer, into: &rect)
+            }
+        }
+    }
+
+    /// Precomp bounds = slot bounds (conservative).
+    /// Computing union of children with transforms is complex; for now use slot bounds.
+    /// This is safe because precomps are typically not huge, and the main perf concern
+    /// is masks on image/shape layers which we handle correctly.
+    private func computePrecompLocalBounds(_ layer: PreCompositionLayer) -> CGRect {
+        let b = layer.contentsLayer.bounds
+        return b.isEmpty ? layer.bounds : b
+    }
+
     // MARK: - Mask Rendering
 
     /// Renders a layer with alpha mask applied.
@@ -278,8 +356,7 @@ public final class LottieOffscreenRenderer {
         state: RenderState
     ) {
         // 1. Calculate crop bounds in layer's LOCAL space (content ∩ masks)
-        // contentBounds and mask paths are in local coords
-        let contentBounds = layer.contentsLayer.bounds
+        let contentBounds = computeLayerLocalContentBounds(layer)
         let maskBounds = calculateMaskBounds(masks)
         var cropRect = contentBounds.intersection(maskBounds)
 
@@ -289,11 +366,11 @@ public final class LottieOffscreenRenderer {
             return
         }
 
-        // Add small padding for anti-aliasing
-        cropRect = cropRect.insetBy(dx: -2, dy: -2)
+        // Add padding for anti-aliasing and make pixel-aligned
+        cropRect = cropRect.insetBy(dx: -2, dy: -2).integral
 
-        let width = Int(ceil(cropRect.width))
-        let height = Int(ceil(cropRect.height))
+        let width = Int(cropRect.width)
+        let height = Int(cropRect.height)
 
         // 2. Get buffers from pool
         guard let contentCtx = contextPool.getRGBA(width: width, height: height),
@@ -322,7 +399,7 @@ public final class LottieOffscreenRenderer {
 
         // 5. Render masks into grayscale buffer
         maskCtx.translateBy(x: -cropRect.origin.x, y: -cropRect.origin.y)
-        renderMasksToGrayscale(masks, into: maskCtx)
+        renderMasksToGrayscale(masks, into: maskCtx, bufferSize: CGSize(width: width, height: height))
 
         // 6. Get images from buffers
         guard let contentImage = contentCtx.makeImage(),
@@ -361,10 +438,15 @@ public final class LottieOffscreenRenderer {
     /// For Add mode: fill path with white * opacity
     /// Multiple Add masks are combined (union).
     ///
-    private func renderMasksToGrayscale(_ masks: [MaskSnapshot], into ctx: CGContext) {
-        // Start with black (fully masked)
+    /// - Parameters:
+    ///   - masks: Array of MaskSnapshot with resolved paths
+    ///   - ctx: Grayscale CGContext to render into
+    ///   - bufferSize: Size of the buffer (for initial black fill)
+    ///
+    private func renderMasksToGrayscale(_ masks: [MaskSnapshot], into ctx: CGContext, bufferSize: CGSize) {
+        // Start with black (fully masked) - fill only the buffer area
         ctx.setFillColor(gray: 0, alpha: 1)
-        ctx.fill(CGRect(x: -10_000_000, y: -10_000_000, width: 20_000_000, height: 20_000_000))
+        ctx.fill(CGRect(origin: .zero, size: bufferSize))
 
         // Render each mask
         for mask in masks {
@@ -385,12 +467,18 @@ public final class LottieOffscreenRenderer {
             case .intersect:
                 // Intersect: more complex, would need separate buffer
                 // For now, treat as add (covers most cases in MinCircles)
+                #if DEBUG
+                print("⚠️ [LottieOffscreenRenderer] Intersect mask mode not fully implemented, treating as Add")
+                #endif
                 ctx.setFillColor(gray: 1, alpha: mask.opacity)
                 ctx.addPath(mask.path)
                 ctx.fillPath(using: .evenOdd)
 
             default:
                 // Other modes (lighten, darken, difference, none) - skip
+                #if DEBUG
+                print("⚠️ [LottieOffscreenRenderer] Unsupported mask mode: \(mask.mode)")
+                #endif
                 break
             }
         }
