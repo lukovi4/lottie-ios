@@ -191,12 +191,16 @@ public final class LottieOffscreenRenderer {
     /// Renders all image layers directly into the CGContext.
     /// This bypasses CALayer.render() completely for true offscreen rendering.
     ///
-    /// CONTRACT: Context is already in UIKit coords (Y-down) from VideoGenerator.
-    /// Both shapes and images use the same CTM - no per-element coordinate flips.
+    /// ## Coordinate System Policy
+    /// - Context is in UIKit coords (Y-down) from VideoGenerator
+    /// - globalTransform places the "slot" in world space
+    /// - Inside the slot, we flip Y for pixel-buffer images (origin bottom-left)
+    /// - This replicates CA's `contentsGravity = .resize` behavior
     ///
-    /// IMAGE FLIP: CGImage pixel data has origin at bottom-left, but we're in UIKit coords.
-    /// We use negative height rect with ACTUAL IMAGE SIZE (not CA layer bounds).
-    /// This is fast (no pixel copying) and independent of CALayer internals.
+    /// ## IMPORTANT: Masks/Mattes Rule
+    /// If applying mask/matte to an image, the clip MUST be in the same gState
+    /// where the flip is applied. Otherwise mask will be upside-down relative to pixels.
+    ///
     private func renderImageLayers(into ctx: CGContext) {
         for layer in imageLayers {
             guard !layer.contentsLayer.isHidden else { continue }
@@ -205,27 +209,46 @@ public final class LottieOffscreenRenderer {
             ctx.saveGState()
             defer { ctx.restoreGState() }
 
-            // Apply global transform (position, scale, rotation, anchor, parent chain)
+            // 1. Apply global transform (position, scale, rotation, anchor, parent chain)
             let transform = layer.transformNode.globalTransform.affineTransform
             ctx.concatenate(transform)
 
-            // Hierarchical opacity
+            // 2. Hierarchical opacity
             ctx.setAlpha(ctx.alpha * CGFloat(layer.transformNode.opacity))
 
-            // Draw image using ACTUAL IMAGE DIMENSIONS (not contentsLayer.bounds!)
-            // contentsLayer.bounds is a CA detail that doesn't apply in offscreen context.
-            // Using image.width/height gives correct local rect independent of CA mechanics.
-            let w = CGFloat(image.width)
-            let h = CGFloat(image.height)
-            let flipRect = CGRect(x: 0, y: h, width: w, height: -h)
-            ctx.draw(image, in: flipRect)
+            // 3. TODO: If mask/matte for this layer exists, apply clip HERE (in world space)
+            //    or inside the flipped gState below if mask is relative to slot content
 
-            // DEBUG: Log first few frames - compare bounds vs actual image size
+            // 4. Draw image with local flip (pixel-buffer images have origin at bottom-left)
+            let bounds = layer.contentsLayer.bounds
+            drawPixelBufferImage(image, inSlot: bounds, ctx: ctx)
+
+            // DEBUG: Log first few frames
             if framesRendered < 3 {
-                let bounds = layer.contentsLayer.bounds
-                print("🖼️ [Image] '\(layer.keypathName ?? "?")': bounds=\(bounds.size) vs image=\(w)x\(h), transform=\(transform)")
+                print("🖼️ [Image] '\(layer.keypathName ?? "?")': slot=\(bounds.size)")
             }
         }
+    }
+
+    /// Draws a CGImage from pixel buffer into a slot with correct orientation.
+    ///
+    /// Pixel-buffer images (video frames, photos from CVPixelBuffer) have origin
+    /// at bottom-left. This helper applies local Y-flip to draw correctly in
+    /// UIKit coordinate context without copying pixels.
+    ///
+    /// - Parameters:
+    ///   - image: The CGImage to draw (from pixel buffer source)
+    ///   - bounds: The slot bounds (Lottie asset size, what globalTransform expects)
+    ///   - ctx: The CGContext to draw into
+    ///
+    /// - Note: If mask/matte applies to slot content, clip should be inside this flip.
+    ///
+    private func drawPixelBufferImage(_ image: CGImage, inSlot bounds: CGRect, ctx: CGContext) {
+        ctx.saveGState()
+        ctx.translateBy(x: 0, y: bounds.height)
+        ctx.scaleBy(x: 1, y: -1)
+        ctx.draw(image, in: CGRect(origin: .zero, size: bounds.size))
+        ctx.restoreGState()
     }
 
     // MARK: - Layer Collection
