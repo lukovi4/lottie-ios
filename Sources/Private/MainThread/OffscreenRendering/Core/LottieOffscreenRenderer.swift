@@ -435,6 +435,8 @@ public final class LottieOffscreenRenderer {
         let contentBounds = computeLayerLocalContentBounds(layer)
         let maskBounds = calculateMaskBounds(masks)
 
+        let layerName = layer.keypathName ?? "?"
+
         // Safety: if masks empty or bounds invalid, fall back to content bounds
         var cropRect: CGRect
         if masks.isEmpty || maskBounds.isNull || maskBounds.isEmpty {
@@ -451,6 +453,23 @@ public final class LottieOffscreenRenderer {
 
             let needsFullBounds = hasSubtractLike || hasInvertedAddLike
             cropRect = needsFullBounds ? contentBounds : contentBounds.intersection(maskBounds)
+        }
+
+        // 🔥 DEBUG: Log for ALL masked layers on frame 0
+        let frameInt = Int(frame)
+        if frameInt == 0 {
+            print("🔥 [MASK-DIAG] layer='\(layerName)' masks=\(masks.count)")
+            print("🔥 [MASK-DIAG]   contentBounds=\(contentBounds)")
+            print("🔥 [MASK-DIAG]   maskBounds=\(maskBounds)")
+            print("🔥 [MASK-DIAG]   cropRect=\(cropRect)")
+            if !masks.isEmpty {
+                print("🔥 [MASK-DIAG]   masks[0].mode=\(masks[0].mode) inverted=\(masks[0].inverted)")
+            }
+            // Check if this is an ImageCompositionLayer and if image is nil
+            if let imageLayer = layer as? ImageCompositionLayer {
+                let hasImage = imageLayer.image != nil
+                print("🔥 [MASK-DIAG]   ImageLayer: image=\(hasImage ? "present" : "NIL!")")
+            }
         }
 
         // Guard against empty or invalid rect
@@ -516,21 +535,35 @@ public final class LottieOffscreenRenderer {
         // in local coords. clip(to:mask:) uses mask alpha to determine visibility.
         let destRect = CGRect(x: cropRect.origin.x, y: cropRect.origin.y, width: CGFloat(width), height: CGFloat(height))
 
-        #if DEBUG
-        // Diagnostic log for debugging mask artifacts
-        let frameInt = Int(frame)
-        if frameInt >= 0 && frameInt <= 50 {
-            print("🔍 [MASK DIAG] frame=\(frameInt) layer='\(layer.keypathName ?? "?")'")
-            print("🔍 [MASK DIAG]   isHidden=\(layer.contentsLayer.isHidden)")
-            print("🔍 [MASK DIAG]   contentBounds=\(contentBounds) maskBounds=\(maskBounds)")
-            print("🔍 [MASK DIAG]   cropRect=\(cropRect) requested=\(width)x\(height)")
-            print("🔍 [MASK DIAG]   contentSize=\(contentImage.width)x\(contentImage.height) maskSize=\(maskImage.width)x\(maskImage.height)")
-            print("🔍 [MASK DIAG]   destRect=\(destRect)")
-            for (i, m) in masks.enumerated() {
-                print("🔍 [MASK DIAG]   mask[\(i)] mode=\(m.mode) opacity=\(String(format: "%.2f", m.opacity)) shapeBounds=\(m.shapeBounds)")
+        // 🔥 DEBUG: Log mask and content info for ALL masked layers on frame 0
+        if frameInt == 0 {
+            print("🔥 [MASK-DIAG] '\(layerName)' destRect=\(destRect)")
+            print("🔥 [MASK-DIAG] '\(layerName)' maskImage: \(maskImage.width)x\(maskImage.height) bpp=\(maskImage.bitsPerPixel)")
+            print("🔥 [MASK-DIAG] '\(layerName)' contentImage: \(contentImage.width)x\(contentImage.height) bpp=\(contentImage.bitsPerPixel)")
+
+            // Sample mask pixels
+            if let dataProvider = maskImage.dataProvider,
+               let data = dataProvider.data,
+               let bytes = CFDataGetBytePtr(data) {
+                let bytesPerRow = maskImage.bytesPerRow
+                let cornerIdx = 10 * bytesPerRow + 10
+                let centerIdx = (maskImage.height / 2) * bytesPerRow + (maskImage.width / 2)
+                print("🔥 [MASK-DIAG] '\(layerName)' mask corner(10,10)=\(bytes[cornerIdx]) center=\(bytes[centerIdx])")
+            }
+
+            // Sample content pixels to verify it's not empty
+            if let dataProvider = contentImage.dataProvider,
+               let data = dataProvider.data,
+               let bytes = CFDataGetBytePtr(data) {
+                let bytesPerRow = contentImage.bytesPerRow
+                let centerIdx = (contentImage.height / 2) * bytesPerRow + (contentImage.width / 2) * 4
+                let r = bytes[centerIdx]
+                let g = bytes[centerIdx + 1]
+                let b = bytes[centerIdx + 2]
+                let a = bytes[centerIdx + 3]
+                print("🔥 [MASK-DIAG] '\(layerName)' content center RGBA=(\(r),\(g),\(b),\(a))")
             }
         }
-        #endif
 
         cg.saveGState()
         cg.setAlpha(state.alpha)

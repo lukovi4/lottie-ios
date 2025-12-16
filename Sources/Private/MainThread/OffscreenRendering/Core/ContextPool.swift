@@ -144,36 +144,50 @@ public final class ContextPool {
         pool.removeAll()
     }
 
-    /// Clears a context to fully transparent, ignoring any existing CTM/clip state.
+    /// Clears an RGBA context to fully transparent.
     ///
-    /// This is critical for correct mask rendering because:
-    /// - resetClip() removes any leftover clips from previous mask operations
-    /// - CTM reset ensures we clear the entire backing store
-    /// - .copy blend mode guarantees full overwrite (no blending with old data)
-    ///
+    /// Use this for content buffers where transparency is needed.
     /// - Parameters:
-    ///   - ctx: The context to clear
-    ///   - width: Width of the backing store (not affected by CTM)
-    ///   - height: Height of the backing store (not affected by CTM)
-    public static func clearContextToTransparent(_ ctx: CGContext, width: Int, height: Int) {
+    ///   - ctx: The RGBA context to clear
+    ///   - width: Width of the backing store
+    ///   - height: Height of the backing store
+    public static func clearRGBA(_ ctx: CGContext, width: Int, height: Int) {
         ctx.saveGState()
         defer { ctx.restoreGState() }
 
-        // 1) Remove any clip path to clear EVERYTHING
         ctx.resetClip()
-
-        // 2) Reset CTM to identity so we fill the actual backing store
         let ctm = ctx.ctm
         if !ctm.isIdentity, let inv = ctm.invertedIfPossible {
             ctx.concatenate(inv)
         }
 
-        // 3) Use .copy to fully overwrite (no blending with previous content)
         ctx.setBlendMode(.copy)
+        // Transparent (alpha=0) — critical for RGBA content compositing
+        ctx.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 0))
+        ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
+    }
 
-        // 4) Fill with transparent
-        // For alpha-only contexts, gray=0 alpha=0 works correctly
-        ctx.setFillColor(CGColor(gray: 0, alpha: 0))
+    /// Clears a grayscale mask context to zero coverage (black).
+    ///
+    /// Use this for luminance-based mask buffers.
+    /// In "coverage = luminance" model: black (0) = fully hidden.
+    /// - Parameters:
+    ///   - ctx: The grayscale mask context to clear
+    ///   - width: Width of the backing store
+    ///   - height: Height of the backing store
+    public static func clearMaskLuminance(_ ctx: CGContext, width: Int, height: Int) {
+        ctx.saveGState()
+        defer { ctx.restoreGState() }
+
+        ctx.resetClip()
+        let ctm = ctx.ctm
+        if !ctm.isIdentity, let inv = ctm.invertedIfPossible {
+            ctx.concatenate(inv)
+        }
+
+        ctx.setBlendMode(.copy)
+        // Black = 0 coverage in luminance model
+        ctx.setFillColor(CGColor(gray: 0, alpha: 1))
         ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
     }
 
@@ -202,9 +216,14 @@ public final class ContextPool {
                 pool[i].inUse = true
                 totalReused += 1
 
-                // Clear the context before reuse using the safe clear method
+                // Clear the context before reuse using type-appropriate method
                 let ctx = pooled.context
-                Self.clearContextToTransparent(ctx, width: pooled.width, height: pooled.height)
+                switch type {
+                case .rgba:
+                    Self.clearRGBA(ctx, width: pooled.width, height: pooled.height)
+                case .mask:
+                    Self.clearMaskLuminance(ctx, width: pooled.width, height: pooled.height)
+                }
 
                 return ctx
             }
@@ -257,27 +276,37 @@ public final class ContextPool {
         )
     }
 
-    /// Creates an alpha-only context for mask rendering.
+    /// Creates a grayscale context for mask rendering (1 byte per pixel, no alpha).
     ///
-    /// Alpha-only format (1 byte per pixel) is optimal for masks because:
-    /// - Coverage is stored directly in alpha channel
-    /// - blendMode operations (destinationOut, destinationIn) work correctly
-    /// - clip(to:mask:) uses alpha as coverage
+    /// We use "Мир 2: coverage = luminance" model:
+    /// - clip(to:mask:) reads LUMINANCE (gray channel) for coverage
+    /// - black (0) = fully hidden, white (1) = fully visible
+    /// - Draw with setFillColor(gray: coverage, alpha: 1)
+    /// - Porter-Duff blendModes (destinationOut, etc.) work on gray values
     ///
-    /// Note: Uses DeviceGray colorSpace with alphaOnly which is well-supported on iOS.
-    /// If compatibility issues arise, fallback to gray+alpha (2 bytes per pixel).
+    /// This is the most stable approach because:
+    /// - No alpha/luminance ambiguity
+    /// - Predictable behavior with clip(to:mask:)
+    /// - 1 byte per pixel = smaller buffers, faster operations
     private func createMaskContext(width: Int, height: Int) -> CGContext? {
         let colorSpace = CGColorSpaceCreateDeviceGray()
-        let bitmapInfo = CGImageAlphaInfo.alphaOnly.rawValue
 
-        return CGContext(
+        let ctx = CGContext(
             data: nil,
             width: width,
             height: height,
             bitsPerComponent: 8,
-            bytesPerRow: width,  // 1 byte per pixel
+            bytesPerRow: width,  // 1 byte per pixel (grayscale, no alpha)
             space: colorSpace,
-            bitmapInfo: bitmapInfo
+            bitmapInfo: CGImageAlphaInfo.none.rawValue
         )
+
+        #if DEBUG
+        if ctx == nil {
+            print("⚠️ [ContextPool] createMaskContext FAILED: \(width)x\(height)")
+        }
+        #endif
+
+        return ctx
     }
 }

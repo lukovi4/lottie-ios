@@ -85,12 +85,14 @@ public final class MaskComposer {
                                         firstMask.mode == .difference ||
                                         firstMask.inverted
 
+        // 🔥 DEBUG: Log mask details — REMOVED for cleaner logs
+
         if needsFullInitialCoverage {
             // Fill accumulator with full coverage (alpha = 1)
             initializeAccumulatorFull(accCtx, width: width, height: height)
         } else {
             // Clear accumulator to transparent (0 coverage)
-            ContextPool.clearContextToTransparent(accCtx, width: width, height: height)
+            ContextPool.clearMaskLuminance(accCtx, width: width, height: height)
         }
 
         // Apply translation offset
@@ -104,12 +106,32 @@ public final class MaskComposer {
 
         accCtx.restoreGState()
 
-        // Extract image from accumulator
-        // IMPORTANT: Crop to requested size since pooled context may be larger
+        // Extract grayscale image from accumulator
         guard let fullImage = accCtx.makeImage() else { return nil }
 
+        #if DEBUG
+        // Debug: sample raw grayscale pixels
+        if let provider = fullImage.dataProvider,
+           let data = provider.data,
+           let bytes = CFDataGetBytePtr(data) {
+            let bpr = fullImage.bytesPerRow
+            let cornerIdx = 10 * bpr + 10
+            let centerIdx = (fullImage.height / 2) * bpr + (fullImage.width / 2)
+            print("🔥 [MaskComposer] grayscale mask:")
+            print("🔥   corner(10,10)=\(bytes[cornerIdx]) center=\(bytes[centerIdx])")
+            print("🔥   For clip(to:mask:): white(255)=visible, black(0)=hidden")
+        }
+        #endif
+
         let cropRegion = CGRect(x: 0, y: 0, width: width, height: height)
-        return fullImage.cropping(to: cropRegion)
+        guard let croppedImage = fullImage.cropping(to: cropRegion) else { return nil }
+
+        // Return grayscale CGImage directly for clip(to:mask:)
+        // clip(to:mask:) semantics for grayscale images:
+        // - white (255) = fully visible
+        // - black (0) = fully hidden
+        // This matches our "coverage = luminance" model
+        return croppedImage
     }
 
     /// Fills the accumulator with full coverage (alpha = 1).
@@ -188,6 +210,12 @@ public final class MaskComposer {
     /// Draws the raw shape path into the context with specified blend mode.
     ///
     /// Uses `shapePath` (raw path without veryLargeRect inversion).
+    ///
+    /// We use "coverage = luminance" model:
+    /// - clip(to:mask:) reads gray channel for coverage
+    /// - gray=0 (black) = fully hidden
+    /// - gray=1 (white) = fully visible
+    /// - gray=opacity encodes partial coverage
     private func drawShapePath(
         _ mask: MaskSnapshot,
         into ctx: CGContext,
@@ -198,9 +226,10 @@ public final class MaskComposer {
 
         ctx.setBlendMode(blendMode)
 
-        // In alpha-only context, we draw white with alpha = opacity
-        // This gives us coverage = opacity where the path is filled
-        ctx.setFillColor(CGColor(gray: 1, alpha: mask.opacity))
+        // Coverage = luminance model:
+        // gray = mask.opacity encodes coverage (0 = hidden, 1 = visible)
+        // alpha = 1 ensures the fill actually applies
+        ctx.setFillColor(CGColor(gray: mask.opacity, alpha: 1))
         ctx.addPath(mask.shapePath)
         ctx.fillPath(using: mask.fillRule)
     }
@@ -222,8 +251,9 @@ public final class MaskComposer {
         defer { accCtx.restoreGState() }
 
         // First: fill full rect with coverage (using normal blend to add to existing)
+        // Coverage = luminance: gray=opacity for partial coverage
         accCtx.setBlendMode(.normal)
-        accCtx.setFillColor(CGColor(gray: 1, alpha: mask.opacity))
+        accCtx.setFillColor(CGColor(gray: mask.opacity, alpha: 1))
 
         // We need to fill the shape bounds in layer coordinates
         // The context already has offset applied, so fill the shapeBounds
@@ -231,8 +261,9 @@ public final class MaskComposer {
         accCtx.fill(boundsRect)
 
         // Second: cut out the shape
+        // Coverage = luminance: gray=1 (white) for full removal
         accCtx.setBlendMode(.destinationOut)
-        accCtx.setFillColor(CGColor(gray: 1, alpha: 1)) // Full removal where shape is
+        accCtx.setFillColor(CGColor(gray: 1, alpha: 1))
         accCtx.addPath(mask.shapePath)
         accCtx.fillPath(using: mask.fillRule)
     }
@@ -262,7 +293,7 @@ public final class MaskComposer {
         defer { contextPool.release(tmpCtx) }
 
         // Clear temp to transparent
-        ContextPool.clearContextToTransparent(tmpCtx, width: width, height: height)
+        ContextPool.clearMaskLuminance(tmpCtx, width: width, height: height)
 
         // Draw mask shape into temp buffer
         tmpCtx.saveGState()
