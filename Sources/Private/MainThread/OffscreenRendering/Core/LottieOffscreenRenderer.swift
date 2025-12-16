@@ -469,14 +469,21 @@ public final class LottieOffscreenRenderer {
         renderMasksToGrayscale(masks, into: maskCtx, bufferSize: CGSize(width: width, height: height))
         maskCtx.restoreGState()
 
-        // 6. Get images from buffers
-        guard let contentImage = contentCtx.makeImage(),
-              let maskImage = maskCtx.makeImage() else {
-            print("⚠️ [LottieOffscreenRenderer] Failed to create images from mask buffers")
+        // 5. Get images from buffers and crop to requested size
+        // IMPORTANT: Pooled context may be larger than requested (width×height).
+        // makeImage() returns full pooled size, so we must crop to the actual
+        // rendered area to avoid mask/content being scaled incorrectly.
+        let cropRegion = CGRect(x: 0, y: 0, width: width, height: height)
+
+        guard let fullContent = contentCtx.makeImage(),
+              let fullMask = maskCtx.makeImage(),
+              let contentImage = fullContent.cropping(to: cropRegion),
+              let maskImage = fullMask.cropping(to: cropRegion) else {
+            print("⚠️ [LottieOffscreenRenderer] Failed to create/crop images from mask buffers")
             return
         }
 
-        // 7. Composite onto main context
+        // 6. Composite onto main context
         // Main context already has globalTransform applied, so we draw at cropRect origin
         // in local coords. clip(to:mask:) uses mask alpha to determine visibility.
         // Apply layer alpha when drawing the composited result.
