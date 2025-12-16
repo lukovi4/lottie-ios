@@ -244,8 +244,8 @@ public final class LottieOffscreenRenderer {
 
         // 6. Render based on layer type (no mask)
         #if DEBUG
-        if layer.keypathName?.contains("Media") == true {
-            print("🔴 [NO MASK] rendering '\(layer.keypathName ?? "?")' WITHOUT mask!")
+        if layer.keypathName.contains("Media") {
+            print("🔴 [NO MASK] rendering '\(layer.keypathName)' WITHOUT mask!")
         }
         #endif
         renderLayerContent(layer, ctx: renderCtx)
