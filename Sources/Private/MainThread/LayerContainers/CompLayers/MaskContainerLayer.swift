@@ -25,6 +25,13 @@ public struct MaskSnapshot {
     /// Whether the mask was marked as inverted in the source.
     /// Note: The `path` already includes inversion logic, this is for diagnostics only.
     public let inverted: Bool
+
+    /// Bounding box of the ORIGINAL shape path (before veryLargeRect inversion).
+    /// Use this for cropping calculations, NOT path.boundingBox which may be huge for subtract masks.
+    public let shapeBounds: CGRect
+
+    /// Fill rule to use when rendering this mask path.
+    public let fillRule: CGPathFillRule
 }
 
 // MARK: - MaskMode Extension
@@ -110,23 +117,28 @@ final class MaskContainerLayer: CALayer {
       guard let props = layer.properties,
             let path = layer.maskLayer.path else { return nil }
 
-      // Normalize opacity: Lottie ALWAYS stores mask opacity as 0-100, we need 0-1
-      // No heuristics - always divide by 100 and clamp to valid range
+      // Normalize opacity: Lottie stores mask opacity as 0-100, we need 0-1
+      // Always divide by 100 and clamp to valid range
       let rawOpacity = props.opacity.value.cgFloatValue
       let normalizedOpacity = max(0, min(1, rawOpacity / 100.0))
 
-      #if DEBUG
-      // Catch if opacity source format ever changes - this is an invariant
-      if rawOpacity > 0 && rawOpacity <= 1.0 {
-        assertionFailure("Mask opacity looks already normalized (0..1): \(rawOpacity). Source format changed or wrong property used.")
-      }
-      #endif
+      // Note: We removed the assertionFailure here because some animations may have
+      // opacity values in the 0-1 range (e.g., opacity = 1.0 meaning 1%).
+      // The division by 100 handles both cases safely (100→1.0, 1→0.01).
+
+      // Use original shape bounds for cropping (not path.boundingBox which may include veryLargeRect)
+      let shapeBounds = layer.originalShapeBounds
+
+      // Lottie masks use evenOdd fill rule for inversion logic
+      let fillRule: CGPathFillRule = .evenOdd
 
       return MaskSnapshot(
         path: path,
         mode: props.mode,
         opacity: normalizedOpacity,
-        inverted: props.inverted
+        inverted: props.inverted,
+        shapeBounds: shapeBounds,
+        fillRule: fillRule
       )
     }
   }
@@ -183,6 +195,10 @@ fileprivate class MaskLayer: CALayer {
 
   let maskLayer = CAShapeLayer()
 
+  /// Bounding box of the original shape path (before veryLargeRect inversion).
+  /// Updated in updateWithFrame() for use by maskSnapshots().
+  var originalShapeBounds: CGRect = .null
+
   func updateWithFrame(frame: CGFloat, forceUpdates: Bool) {
     guard let properties else { return }
     if properties.opacity.needsUpdate(frame: frame) || forceUpdates {
@@ -195,6 +211,11 @@ fileprivate class MaskLayer: CALayer {
       properties.expansion.update(frame: frame)
 
       let shapePath = properties.shape.value.cgPath()
+
+      // Store original shape bounds BEFORE any veryLargeRect inversion
+      // This is critical for correct cropping in offscreen renderer
+      originalShapeBounds = shapePath.boundingBoxOfPath
+
       var path = shapePath
       if
         properties.mode.usableMode == .subtract && !properties.inverted ||

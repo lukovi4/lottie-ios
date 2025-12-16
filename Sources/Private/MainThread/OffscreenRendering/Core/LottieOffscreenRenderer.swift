@@ -61,6 +61,9 @@ public final class LottieOffscreenRenderer {
     /// Pool of reusable CGContext buffers for mask rendering
     private let contextPool = ContextPool()
 
+    /// Composer for combining multiple masks with correct Porter-Duff operations
+    private lazy var maskComposer = MaskComposer(contextPool: contextPool)
+
     // MARK: - Metrics (for debugging/profiling)
 
     /// Number of frames rendered since creation
@@ -450,23 +453,17 @@ public final class LottieOffscreenRenderer {
         let width = Int(cropRect.width)
         let height = Int(cropRect.height)
 
-        // 2. Get buffers from pool
-        guard let contentCtx = contextPool.getRGBA(width: width, height: height),
-              let maskCtx = contextPool.getGrayscale(width: width, height: height) else {
-            // Fallback: render without mask if we can't get buffers
-            print("⚠️ [LottieOffscreenRenderer] Failed to get context buffers for mask, rendering without mask")
+        // 2. Get content buffer from pool
+        guard let contentCtx = contextPool.getRGBA(width: width, height: height) else {
+            // Fallback: render without mask if we can't get buffer
+            print("⚠️ [LottieOffscreenRenderer] Failed to get content buffer for mask, rendering without mask")
             let renderCtx = RenderContext(cg: cg, state: state, frame: frame)
             renderLayerContent(layer, ctx: renderCtx)
             return
         }
-
-        defer {
-            contextPool.release(contentCtx)
-            contextPool.release(maskCtx)
-        }
+        defer { contextPool.release(contentCtx) }
 
         // 3. Render layer content into RGBA buffer
-        // IMPORTANT: Wrap translateBy in saveGState/restoreGState to not pollute pooled context
         contentCtx.saveGState()
         contentCtx.translateBy(x: -cropRect.origin.x, y: -cropRect.origin.y)
         let offscreenState = RenderState(alpha: 1.0)
@@ -474,31 +471,32 @@ public final class LottieOffscreenRenderer {
         renderLayerContent(layer, ctx: contentRenderCtx)
         contentCtx.restoreGState()
 
-        // 4. Render masks into grayscale buffer
-        // IMPORTANT: Wrap translateBy in saveGState/restoreGState to not pollute pooled context
-        maskCtx.saveGState()
-        maskCtx.translateBy(x: -cropRect.origin.x, y: -cropRect.origin.y)
-        renderMasksToGrayscale(masks, into: maskCtx, bufferSize: CGSize(width: width, height: height))
-        maskCtx.restoreGState()
+        // 4. Compose masks using MaskComposer (handles Add/Subtract/Intersect correctly)
+        let offset = CGPoint(x: -cropRect.origin.x, y: -cropRect.origin.y)
+        guard let maskImage = maskComposer.compose(masks: masks, width: width, height: height, offset: offset) else {
+            print("⚠️ [LottieOffscreenRenderer] MaskComposer failed, rendering without mask")
+            // Fallback: get content and draw without mask
+            if let contentImage = contentCtx.makeImage()?.cropping(to: CGRect(x: 0, y: 0, width: width, height: height)) {
+                let destRect = CGRect(x: cropRect.origin.x, y: cropRect.origin.y, width: CGFloat(width), height: CGFloat(height))
+                cg.saveGState()
+                cg.setAlpha(state.alpha)
+                cg.draw(contentImage, in: destRect)
+                cg.restoreGState()
+            }
+            return
+        }
 
-        // 5. Get images from buffers and crop to requested size
-        // IMPORTANT: Pooled context may be larger than requested (width×height).
-        // makeImage() returns full pooled size, so we must crop to the actual
-        // rendered area to avoid mask/content being scaled incorrectly.
+        // 5. Get content image and crop to requested size
         let cropRegion = CGRect(x: 0, y: 0, width: width, height: height)
-
         guard let fullContent = contentCtx.makeImage(),
-              let fullMask = maskCtx.makeImage(),
-              let contentImage = fullContent.cropping(to: cropRegion),
-              let maskImage = fullMask.cropping(to: cropRegion) else {
-            print("⚠️ [LottieOffscreenRenderer] Failed to create/crop images from mask buffers")
+              let contentImage = fullContent.cropping(to: cropRegion) else {
+            print("⚠️ [LottieOffscreenRenderer] Failed to create content image")
             return
         }
 
         // 6. Composite onto main context
         // Main context already has globalTransform applied, so we draw at cropRect origin
         // in local coords. clip(to:mask:) uses mask alpha to determine visibility.
-        // Apply layer alpha when drawing the composited result.
         let destRect = CGRect(x: cropRect.origin.x, y: cropRect.origin.y, width: CGFloat(width), height: CGFloat(height))
 
         #if DEBUG
@@ -509,12 +507,10 @@ public final class LottieOffscreenRenderer {
             print("🔍 [MASK DIAG]   isHidden=\(layer.contentsLayer.isHidden)")
             print("🔍 [MASK DIAG]   contentBounds=\(contentBounds) maskBounds=\(maskBounds)")
             print("🔍 [MASK DIAG]   cropRect=\(cropRect) requested=\(width)x\(height)")
-            print("🔍 [MASK DIAG]   pooledContent=\(contentCtx.width)x\(contentCtx.height) pooledMask=\(maskCtx.width)x\(maskCtx.height)")
-            print("🔍 [MASK DIAG]   fullMask=\(fullMask.width)x\(fullMask.height) croppedMask=\(maskImage.width)x\(maskImage.height)")
+            print("🔍 [MASK DIAG]   contentSize=\(contentImage.width)x\(contentImage.height) maskSize=\(maskImage.width)x\(maskImage.height)")
             print("🔍 [MASK DIAG]   destRect=\(destRect)")
             for (i, m) in masks.enumerated() {
-                let pathBBox = m.path.boundingBoxOfPath
-                print("🔍 [MASK DIAG]   mask[\(i)] mode=\(m.mode) opacity=\(m.opacity) inverted=\(m.inverted) pathBBox=\(pathBBox)")
+                print("🔍 [MASK DIAG]   mask[\(i)] mode=\(m.mode) opacity=\(String(format: "%.2f", m.opacity)) shapeBounds=\(m.shapeBounds)")
             }
         }
         #endif
@@ -527,75 +523,19 @@ public final class LottieOffscreenRenderer {
     }
 
     /// Calculates the bounding box of all masks combined.
-    /// Uses boundingBoxOfPath (actual curve bbox) instead of boundingBox (control points bbox)
-    /// for more accurate cropping.
+    /// Uses shapeBounds (original shape before veryLargeRect inversion) instead of path.boundingBox
+    /// which would be huge for subtract masks and break cropping optimization.
     private func calculateMaskBounds(_ masks: [MaskSnapshot]) -> CGRect {
         var bounds = CGRect.null
         for mask in masks {
-            let pathBounds = mask.path.boundingBoxOfPath
-            if !pathBounds.isNull && !pathBounds.isEmpty {
-                bounds = bounds.isNull ? pathBounds : bounds.union(pathBounds)
+            // Use shapeBounds which is the original shape bbox, NOT path.boundingBox
+            // path may contain veryLargeRect for subtract/inverted masks
+            let shapeBounds = mask.shapeBounds
+            if !shapeBounds.isNull && !shapeBounds.isEmpty {
+                bounds = bounds.isNull ? shapeBounds : bounds.union(shapeBounds)
             }
         }
         return bounds
-    }
-
-    /// Renders masks into a grayscale context.
-    /// White (1.0) = fully visible, Black (0.0) = fully masked.
-    ///
-    /// For Add mode: fill path with white * opacity
-    /// Multiple Add masks are combined (union).
-    ///
-    /// - Parameters:
-    ///   - masks: Array of MaskSnapshot with resolved paths
-    ///   - ctx: Grayscale CGContext to render into
-    ///   - bufferSize: Size of the buffer (for initial black fill)
-    ///
-    private func renderMasksToGrayscale(_ masks: [MaskSnapshot], into ctx: CGContext, bufferSize: CGSize) {
-        // Start with black (fully masked) - fill only the buffer area
-        ctx.setFillColor(gray: 0, alpha: 1)
-        ctx.fill(CGRect(origin: .zero, size: bufferSize))
-
-        // Render each mask
-        // IMPORTANT: Grayscale context has no alpha channel (CGImageAlphaInfo.none),
-        // so we encode opacity directly into the gray value (0=masked, 1=visible).
-        // clip(to:mask:) uses pixel brightness as alpha.
-        for mask in masks {
-            #if DEBUG
-            print("   🎨 mask.opacity=\(mask.opacity) mode=\(mask.mode)")
-            #endif
-            switch mask.mode {
-            case .add:
-                // Add mode: gray = opacity (0% opacity → black, 100% → white)
-                ctx.setFillColor(gray: mask.opacity, alpha: 1)
-                ctx.addPath(mask.path)
-                ctx.fillPath(using: .evenOdd)
-
-            case .subtract:
-                // Subtract: path already contains veryLargeRect with evenOdd
-                // Fill with black to subtract (inverse of opacity)
-                ctx.setFillColor(gray: 1.0 - mask.opacity, alpha: 1)
-                ctx.addPath(mask.path)
-                ctx.fillPath(using: .evenOdd)
-
-            case .intersect:
-                // Intersect: more complex, would need separate buffer
-                // For now, treat as add (covers most cases in MinCircles)
-                #if DEBUG
-                print("⚠️ [LottieOffscreenRenderer] Intersect mask mode not fully implemented, treating as Add")
-                #endif
-                ctx.setFillColor(gray: mask.opacity, alpha: 1)
-                ctx.addPath(mask.path)
-                ctx.fillPath(using: .evenOdd)
-
-            default:
-                // Other modes (lighten, darken, difference, none) - skip
-                #if DEBUG
-                print("⚠️ [LottieOffscreenRenderer] Unsupported mask mode: \(mask.mode)")
-                #endif
-                break
-            }
-        }
     }
 
     // MARK: - Shape Rendering

@@ -11,6 +11,17 @@
 
 import CoreGraphics
 
+// MARK: - CGAffineTransform Extension
+
+private extension CGAffineTransform {
+    /// Safely inverts the transform, returning nil if not invertible.
+    var invertedIfPossible: CGAffineTransform? {
+        let det = a * d - b * c
+        guard abs(det) > 1e-12 else { return nil }
+        return inverted()
+    }
+}
+
 // MARK: - ContextPool
 
 /// A pool of reusable CGContext buffers for offscreen rendering.
@@ -46,7 +57,7 @@ public final class ContextPool {
     /// Type of context buffer
     public enum ContextType {
         case rgba       // 4 bytes per pixel, for content
-        case grayscale  // 1 byte per pixel, for masks
+        case mask       // 1 byte per pixel, alpha-only for masks (coverage buffer)
     }
 
     /// A pooled context with metadata
@@ -91,14 +102,26 @@ public final class ContextPool {
         getContext(width: width, height: height, type: .rgba)
     }
 
-    /// Gets or creates a grayscale context of the specified size.
+    /// Gets or creates an alpha-only mask context of the specified size.
+    ///
+    /// Alpha-only format is better than grayscale for masks because:
+    /// - opacity = alpha works naturally
+    /// - blendMode operations work correctly (destinationOut, destinationIn)
+    /// - clip(to:mask:) gets correct coverage
     ///
     /// - Parameters:
     ///   - width: Width in pixels
     ///   - height: Height in pixels
     /// - Returns: A CGContext ready for drawing, or nil if creation failed
+    public func getMask(width: Int, height: Int) -> CGContext? {
+        getContext(width: width, height: height, type: .mask)
+    }
+
+    /// Gets or creates a grayscale context of the specified size.
+    /// @deprecated Use getMask() instead for mask rendering.
+    @available(*, deprecated, message: "Use getMask() for alpha-only mask contexts")
     public func getGrayscale(width: Int, height: Int) -> CGContext? {
-        getContext(width: width, height: height, type: .grayscale)
+        getContext(width: width, height: height, type: .mask)
     }
 
     /// Returns a context to the pool for reuse.
@@ -119,6 +142,39 @@ public final class ContextPool {
     /// Call this when export is complete to free memory.
     public func clear() {
         pool.removeAll()
+    }
+
+    /// Clears a context to fully transparent, ignoring any existing CTM/clip state.
+    ///
+    /// This is critical for correct mask rendering because:
+    /// - resetClip() removes any leftover clips from previous mask operations
+    /// - CTM reset ensures we clear the entire backing store
+    /// - .copy blend mode guarantees full overwrite (no blending with old data)
+    ///
+    /// - Parameters:
+    ///   - ctx: The context to clear
+    ///   - width: Width of the backing store (not affected by CTM)
+    ///   - height: Height of the backing store (not affected by CTM)
+    public static func clearContextToTransparent(_ ctx: CGContext, width: Int, height: Int) {
+        ctx.saveGState()
+        defer { ctx.restoreGState() }
+
+        // 1) Remove any clip path to clear EVERYTHING
+        ctx.resetClip()
+
+        // 2) Reset CTM to identity so we fill the actual backing store
+        let ctm = ctx.ctm
+        if !ctm.isIdentity, let inv = ctm.invertedIfPossible {
+            ctx.concatenate(inv)
+        }
+
+        // 3) Use .copy to fully overwrite (no blending with previous content)
+        ctx.setBlendMode(.copy)
+
+        // 4) Fill with transparent
+        // For alpha-only contexts, gray=0 alpha=0 works correctly
+        ctx.setFillColor(CGColor(gray: 0, alpha: 0))
+        ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
     }
 
     /// Logs pool statistics.
@@ -146,25 +202,9 @@ public final class ContextPool {
                 pool[i].inUse = true
                 totalReused += 1
 
-                // Clear the context before reuse
-                // IMPORTANT: Reset CTM to identity before clearing to ensure we clear
-                // the entire backing store regardless of any leftover transforms
+                // Clear the context before reuse using the safe clear method
                 let ctx = pooled.context
-                ctx.saveGState()
-
-                // Reset CTM to identity by applying inverse of current transform
-                let currentCTM = ctx.ctm
-                if !currentCTM.isIdentity {
-                    let inverse = currentCTM.inverted()
-                    ctx.concatenate(inverse)
-                }
-
-                // Clear using .copy blend mode to guarantee full overwrite
-                ctx.setBlendMode(.copy)
-                ctx.setFillColor(CGColor(gray: 0, alpha: 0))
-                ctx.fill(CGRect(x: 0, y: 0, width: pooled.width, height: pooled.height))
-
-                ctx.restoreGState()
+                Self.clearContextToTransparent(ctx, width: pooled.width, height: pooled.height)
 
                 return ctx
             }
@@ -196,8 +236,8 @@ public final class ContextPool {
         switch type {
         case .rgba:
             return createRGBAContext(width: width, height: height)
-        case .grayscale:
-            return createGrayscaleContext(width: width, height: height)
+        case .mask:
+            return createMaskContext(width: width, height: height)
         }
     }
 
@@ -217,17 +257,27 @@ public final class ContextPool {
         )
     }
 
-    private func createGrayscaleContext(width: Int, height: Int) -> CGContext? {
+    /// Creates an alpha-only context for mask rendering.
+    ///
+    /// Alpha-only format (1 byte per pixel) is optimal for masks because:
+    /// - Coverage is stored directly in alpha channel
+    /// - blendMode operations (destinationOut, destinationIn) work correctly
+    /// - clip(to:mask:) uses alpha as coverage
+    ///
+    /// Note: Uses DeviceGray colorSpace with alphaOnly which is well-supported on iOS.
+    /// If compatibility issues arise, fallback to gray+alpha (2 bytes per pixel).
+    private func createMaskContext(width: Int, height: Int) -> CGContext? {
         let colorSpace = CGColorSpaceCreateDeviceGray()
+        let bitmapInfo = CGImageAlphaInfo.alphaOnly.rawValue
 
         return CGContext(
             data: nil,
             width: width,
             height: height,
             bitsPerComponent: 8,
-            bytesPerRow: width,
+            bytesPerRow: width,  // 1 byte per pixel
             space: colorSpace,
-            bitmapInfo: CGImageAlphaInfo.none.rawValue
+            bitmapInfo: bitmapInfo
         )
     }
 }
