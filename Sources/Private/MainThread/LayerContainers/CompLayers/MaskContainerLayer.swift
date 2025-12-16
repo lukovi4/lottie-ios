@@ -12,9 +12,14 @@ import QuartzCore
 /// Snapshot of a resolved mask for the current frame.
 /// Used by LottieOffscreenRenderer to render masks without accessing private internals.
 public struct MaskSnapshot {
-    /// Final resolved CGPath ready for rendering.
-    /// Includes any inversion logic (veryLargeRect + evenOdd) already applied.
-    public let path: CGPath
+    /// Raw shape path WITHOUT any inversion transforms.
+    /// Use this for MaskComposer operations (destinationOut, etc.).
+    public let shapePath: CGPath
+
+    /// Final resolved CGPath for CALayer rendering.
+    /// Includes veryLargeRect + evenOdd inversion for subtract/inverted modes.
+    /// Use this only for CA-based rendering or A/B testing against CALayer.render().
+    public let bakedPath: CGPath
 
     /// The mask mode (add, subtract, intersect, etc.)
     public let mode: MaskMode
@@ -23,14 +28,15 @@ public struct MaskSnapshot {
     public let opacity: CGFloat
 
     /// Whether the mask was marked as inverted in the source.
-    /// Note: The `path` already includes inversion logic, this is for diagnostics only.
     public let inverted: Bool
 
-    /// Bounding box of the ORIGINAL shape path (before veryLargeRect inversion).
-    /// Use this for cropping calculations, NOT path.boundingBox which may be huge for subtract masks.
+    /// Bounding box of the shape path.
+    /// Use this for cropping calculations.
     public let shapeBounds: CGRect
 
-    /// Fill rule to use when rendering this mask path.
+    /// Fill rule to use when rendering the shape path.
+    /// For raw shapePath, use .winding (default).
+    /// The bakedPath uses .evenOdd for veryLargeRect inversion trick.
     public let fillRule: CGPathFillRule
 }
 
@@ -115,7 +121,8 @@ final class MaskContainerLayer: CALayer {
   public func maskSnapshots() -> [MaskSnapshot] {
     maskLayers.compactMap { layer -> MaskSnapshot? in
       guard let props = layer.properties,
-            let path = layer.maskLayer.path else { return nil }
+            let rawPath = layer.rawShapePath,
+            let bakedPath = layer.maskLayer.path else { return nil }
 
       // Normalize opacity: Lottie stores mask opacity as 0-100, we need 0-1
       // Always divide by 100 and clamp to valid range
@@ -129,11 +136,13 @@ final class MaskContainerLayer: CALayer {
       // Use original shape bounds for cropping (not path.boundingBox which may include veryLargeRect)
       let shapeBounds = layer.originalShapeBounds
 
-      // Lottie masks use evenOdd fill rule for inversion logic
-      let fillRule: CGPathFillRule = .evenOdd
+      // Raw shapePath uses winding fill rule (standard)
+      // BakedPath uses evenOdd for veryLargeRect inversion trick
+      let fillRule: CGPathFillRule = .winding
 
       return MaskSnapshot(
-        path: path,
+        shapePath: rawPath,
+        bakedPath: bakedPath,
         mode: props.mode,
         opacity: normalizedOpacity,
         inverted: props.inverted,
@@ -195,6 +204,10 @@ fileprivate class MaskLayer: CALayer {
 
   let maskLayer = CAShapeLayer()
 
+  /// Raw shape path WITHOUT veryLargeRect inversion.
+  /// Updated in updateWithFrame() for use by MaskComposer.
+  var rawShapePath: CGPath?
+
   /// Bounding box of the original shape path (before veryLargeRect inversion).
   /// Updated in updateWithFrame() for use by maskSnapshots().
   var originalShapeBounds: CGRect = .null
@@ -212,11 +225,15 @@ fileprivate class MaskLayer: CALayer {
 
       let shapePath = properties.shape.value.cgPath()
 
+      // Store raw shape path for MaskComposer (without veryLargeRect)
+      rawShapePath = shapePath
+
       // Store original shape bounds BEFORE any veryLargeRect inversion
       // This is critical for correct cropping in offscreen renderer
       originalShapeBounds = shapePath.boundingBoxOfPath
 
-      var path = shapePath
+      // Create baked path with veryLargeRect for CALayer rendering
+      var bakedPath = shapePath
       if
         properties.mode.usableMode == .subtract && !properties.inverted ||
         (properties.mode.usableMode == .add && properties.inverted)
@@ -225,9 +242,9 @@ fileprivate class MaskLayer: CALayer {
         let newPath = CGMutablePath()
         newPath.addRect(CGRect.veryLargeRect)
         newPath.addPath(shapePath)
-        path = newPath
+        bakedPath = newPath
       }
-      maskLayer.path = path
+      maskLayer.path = bakedPath
     }
   }
 }

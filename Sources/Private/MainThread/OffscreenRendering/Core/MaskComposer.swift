@@ -15,15 +15,21 @@ import CoreGraphics
 
 /// Composes multiple masks into a single alpha coverage buffer.
 ///
-/// This implements the correct Lottie mask semantics:
-/// - **Add / Lighten**: Union coverage (sourceOver)
-/// - **Subtract / Darken**: Remove coverage (destinationOut)
-/// - **Intersect / Difference**: Intersect coverage (destinationIn via temp buffer)
+/// This implements the correct Lottie mask semantics using raw shape paths:
+/// - **Add**: Union coverage — draw shape with `.normal` blend
+/// - **Add + inverted**: Show everything except shape — fill full rect, then `.destinationOut` shape
+/// - **Subtract**: Remove coverage — `.destinationOut` on shape
+/// - **Subtract + inverted**: Remove everything except shape — complex case
+/// - **Intersect**: Keep only intersection — `.destinationIn` via temp buffer
+///
+/// ## Important
+/// This class works with `MaskSnapshot.shapePath` (raw path without veryLargeRect),
+/// NOT with `bakedPath`. The inversion logic is handled explicitly here.
 ///
 /// ## Usage
 /// ```swift
 /// let composer = MaskComposer(contextPool: pool)
-/// let maskImage = composer.compose(masks: masks, cropRect: rect)
+/// let maskImage = composer.compose(masks: masks, width: w, height: h, offset: pt)
 /// // Use maskImage with CGContext.clip(to:mask:)
 /// ```
 ///
@@ -69,14 +75,29 @@ public final class MaskComposer {
         }
         defer { contextPool.release(accCtx) }
 
-        // Clear accumulator to transparent (0 coverage = fully masked)
-        ContextPool.clearContextToTransparent(accCtx, width: width, height: height)
+        // Determine initial coverage based on first mask
+        // - Add (non-inverted): start empty, add shape coverage
+        // - Subtract / Intersect / Inverted: start full, then modify
+        let firstMask = masks[0]
+        let needsFullInitialCoverage = firstMask.mode == .subtract ||
+                                        firstMask.mode == .darken ||
+                                        firstMask.mode == .intersect ||
+                                        firstMask.mode == .difference ||
+                                        firstMask.inverted
+
+        if needsFullInitialCoverage {
+            // Fill accumulator with full coverage (alpha = 1)
+            initializeAccumulatorFull(accCtx, width: width, height: height)
+        } else {
+            // Clear accumulator to transparent (0 coverage)
+            ContextPool.clearContextToTransparent(accCtx, width: width, height: height)
+        }
 
         // Apply translation offset
         accCtx.saveGState()
         accCtx.translateBy(x: offset.x, y: offset.y)
 
-        // Compose all masks
+        // Compose all masks with their actual modes
         for mask in masks {
             composeMask(mask, into: accCtx, width: width, height: height, offset: offset)
         }
@@ -91,9 +112,34 @@ public final class MaskComposer {
         return fullImage.cropping(to: cropRegion)
     }
 
+    /// Fills the accumulator with full coverage (alpha = 1).
+    /// Used when first mask is subtract/intersect/inverted.
+    private func initializeAccumulatorFull(_ ctx: CGContext, width: Int, height: Int) {
+        ctx.saveGState()
+        defer { ctx.restoreGState() }
+
+        // Reset any transforms
+        ctx.resetClip()
+        let ctm = ctx.ctm
+        if !ctm.isIdentity {
+            let det = ctm.a * ctm.d - ctm.b * ctm.c
+            if abs(det) > 1e-12 {
+                ctx.concatenate(ctm.inverted())
+            }
+        }
+
+        // Fill with full coverage
+        ctx.setBlendMode(.copy)
+        ctx.setFillColor(CGColor(gray: 1, alpha: 1))
+        ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
+    }
+
     // MARK: - Private
 
     /// Composes a single mask into the accumulator context.
+    ///
+    /// Uses raw `shapePath` and applies mode/inverted logic explicitly.
+    /// Accumulator must be pre-initialized (empty or full) based on first mask.
     private func composeMask(
         _ mask: MaskSnapshot,
         into accCtx: CGContext,
@@ -103,17 +149,35 @@ public final class MaskComposer {
     ) {
         switch mask.mode {
         case .add, .lighten:
-            // Add: draw coverage with normal blend (union)
-            drawMaskShape(mask, into: accCtx, blendMode: .normal)
+            if mask.inverted {
+                // Inverted Add: show everything EXCEPT the shape
+                // Fill full coverage, then cut out shape
+                composeInvertedAdd(mask, into: accCtx, width: width, height: height, offset: offset)
+            } else {
+                // Normal Add: draw shape coverage (union)
+                drawShapePath(mask, into: accCtx, blendMode: .normal)
+            }
 
         case .subtract, .darken:
-            // Subtract: remove coverage using destinationOut
-            // destinationOut: dst = dst * (1 - src.alpha)
-            drawMaskShape(mask, into: accCtx, blendMode: .destinationOut)
+            if mask.inverted {
+                // Inverted Subtract: keep only the shape area
+                // This is equivalent to intersect with shape
+                composeIntersect(mask, into: accCtx, width: width, height: height, offset: offset)
+            } else {
+                // Normal Subtract: remove shape from coverage
+                // destinationOut: dst = dst * (1 - src.alpha)
+                drawShapePath(mask, into: accCtx, blendMode: .destinationOut)
+            }
 
         case .intersect, .difference:
-            // Intersect: requires temp buffer for AND operation
-            composeIntersect(mask, into: accCtx, width: width, height: height, offset: offset)
+            if mask.inverted {
+                // Inverted Intersect: keep only where shape is NOT
+                // This is subtract semantics
+                drawShapePath(mask, into: accCtx, blendMode: .destinationOut)
+            } else {
+                // Normal Intersect: keep only where both have coverage
+                composeIntersect(mask, into: accCtx, width: width, height: height, offset: offset)
+            }
 
         case .none:
             // Skip masks with mode .none
@@ -121,12 +185,10 @@ public final class MaskComposer {
         }
     }
 
-    /// Draws a mask shape into the context with specified blend mode.
+    /// Draws the raw shape path into the context with specified blend mode.
     ///
-    /// For alpha-only contexts:
-    /// - We draw with white (gray=1) and let alpha control coverage
-    /// - opacity is encoded in the fill alpha
-    private func drawMaskShape(
+    /// Uses `shapePath` (raw path without veryLargeRect inversion).
+    private func drawShapePath(
         _ mask: MaskSnapshot,
         into ctx: CGContext,
         blendMode: CGBlendMode
@@ -139,8 +201,40 @@ public final class MaskComposer {
         // In alpha-only context, we draw white with alpha = opacity
         // This gives us coverage = opacity where the path is filled
         ctx.setFillColor(CGColor(gray: 1, alpha: mask.opacity))
-        ctx.addPath(mask.path)
+        ctx.addPath(mask.shapePath)
         ctx.fillPath(using: mask.fillRule)
+    }
+
+    /// Composes an inverted Add mask.
+    ///
+    /// Algorithm:
+    /// 1. Fill entire bounds with coverage
+    /// 2. Cut out the shape using destinationOut
+    /// Result: coverage everywhere EXCEPT the shape
+    private func composeInvertedAdd(
+        _ mask: MaskSnapshot,
+        into accCtx: CGContext,
+        width: Int,
+        height: Int,
+        offset: CGPoint
+    ) {
+        accCtx.saveGState()
+        defer { accCtx.restoreGState() }
+
+        // First: fill full rect with coverage (using normal blend to add to existing)
+        accCtx.setBlendMode(.normal)
+        accCtx.setFillColor(CGColor(gray: 1, alpha: mask.opacity))
+
+        // We need to fill the shape bounds in layer coordinates
+        // The context already has offset applied, so fill the shapeBounds
+        let boundsRect = mask.shapeBounds
+        accCtx.fill(boundsRect)
+
+        // Second: cut out the shape
+        accCtx.setBlendMode(.destinationOut)
+        accCtx.setFillColor(CGColor(gray: 1, alpha: 1)) // Full removal where shape is
+        accCtx.addPath(mask.shapePath)
+        accCtx.fillPath(using: mask.fillRule)
     }
 
     /// Composes an intersect mask using a temporary buffer.
@@ -162,7 +256,7 @@ public final class MaskComposer {
             print("⚠️ [MaskComposer] Failed to get temp buffer for intersect, falling back to add")
             #endif
             // Fallback to add if we can't get temp buffer
-            drawMaskShape(mask, into: accCtx, blendMode: .normal)
+            drawShapePath(mask, into: accCtx, blendMode: .normal)
             return
         }
         defer { contextPool.release(tmpCtx) }
@@ -173,7 +267,7 @@ public final class MaskComposer {
         // Draw mask shape into temp buffer
         tmpCtx.saveGState()
         tmpCtx.translateBy(x: offset.x, y: offset.y)
-        drawMaskShape(mask, into: tmpCtx, blendMode: .normal)
+        drawShapePath(mask, into: tmpCtx, blendMode: .normal)
         tmpCtx.restoreGState()
 
         // Get image from temp buffer
