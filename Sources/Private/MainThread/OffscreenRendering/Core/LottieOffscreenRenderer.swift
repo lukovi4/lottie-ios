@@ -434,10 +434,6 @@ public final class LottieOffscreenRenderer {
         let width = Int(cropRect.width)
         let height = Int(cropRect.height)
 
-        #if DEBUG
-        print("   final cropRect: \(cropRect) (\(width)x\(height))")
-        #endif
-
         // 2. Get buffers from pool
         guard let contentCtx = contextPool.getRGBA(width: width, height: height),
               let maskCtx = contextPool.getGrayscale(width: width, height: height) else {
@@ -487,9 +483,28 @@ public final class LottieOffscreenRenderer {
         // Main context already has globalTransform applied, so we draw at cropRect origin
         // in local coords. clip(to:mask:) uses mask alpha to determine visibility.
         // Apply layer alpha when drawing the composited result.
+        let destRect = CGRect(x: cropRect.origin.x, y: cropRect.origin.y, width: CGFloat(width), height: CGFloat(height))
+
+        #if DEBUG
+        // Diagnostic log for debugging mask artifacts
+        let frameInt = Int(frame)
+        if frameInt >= 0 && frameInt <= 50 {
+            print("🔍 [MASK DIAG] frame=\(frameInt) layer='\(layer.keypathName ?? "?")'")
+            print("   isHidden=\(layer.contentsLayer.isHidden)")
+            print("   contentBounds=\(contentBounds) maskBounds=\(maskBounds)")
+            print("   cropRect=\(cropRect) requested=\(width)x\(height)")
+            print("   pooledContent=\(contentCtx.width)x\(contentCtx.height) pooledMask=\(maskCtx.width)x\(maskCtx.height)")
+            print("   fullMask=\(fullMask.width)x\(fullMask.height) croppedMask=\(maskImage.width)x\(maskImage.height)")
+            print("   destRect=\(destRect)")
+            for (i, m) in masks.enumerated() {
+                let pathBBox = m.path.boundingBoxOfPath
+                print("   mask[\(i)] mode=\(m.mode) opacity=\(m.opacity) inverted=\(m.inverted) pathBBox=\(pathBBox)")
+            }
+        }
+        #endif
+
         cg.saveGState()
         cg.setAlpha(state.alpha)
-        let destRect = CGRect(x: cropRect.origin.x, y: cropRect.origin.y, width: CGFloat(width), height: CGFloat(height))
         cg.clip(to: destRect, mask: maskImage)
         cg.draw(contentImage, in: destRect)
         cg.restoreGState()
