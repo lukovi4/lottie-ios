@@ -211,9 +211,24 @@ public final class LottieOffscreenRenderer {
         into cg: CGContext,
         state: RenderState
     ) {
-        // 0) IP/OP gating — don't render layers outside their visibility range
         let ip = layer.inFrame
         let op = layer.outFrame
+        let layerHidden = layer.isHidden
+        let contentsHidden = layer.contentsLayer.isHidden
+
+        // DEBUG: Точечный лог для Media слоёв на кадрах 10-35
+        #if DEBUG
+        let frameInt = Int(frame)
+        if let name = layer.keypathName, name.contains("Media"), frameInt >= 10 && frameInt <= 35 {
+            print("📍 [VISIBILITY] frame=\(frameInt) layer='\(name)' ip=\(ip) op=\(op)")
+            print("   layer.isHidden=\(layerHidden) contentsLayer.isHidden=\(contentsHidden)")
+            let willSkipByIP = frame + 0.0001 < ip
+            let willSkipByOP = frame >= op - 0.0001
+            print("   willSkipByIP=\(willSkipByIP) willSkipByOP=\(willSkipByOP)")
+        }
+        #endif
+
+        // 0) IP/OP gating — don't render layers outside their visibility range
         if op > ip {
             let eps: CGFloat = 0.0001
             if frame + eps < ip || frame >= op - eps { return }
@@ -222,8 +237,8 @@ public final class LottieOffscreenRenderer {
             return
         }
 
-        // 1) Runtime hidden check
-        guard !layer.contentsLayer.isHidden else { return }
+        // 1) Runtime hidden check (check BOTH layer and contentsLayer)
+        guard !layerHidden && !contentsHidden else { return }
 
         cg.saveGState()
         defer { cg.restoreGState() }
