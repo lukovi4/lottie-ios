@@ -3,7 +3,7 @@
 //  lottie-ios
 //
 //  Created for Animi offscreen rendering support.
-//  Provides reusable CGContext buffers for mask and content rendering.
+//  Provides reusable CGContext buffers for RGBA content rendering.
 //
 //  IMPORTANT: This class is NOT thread-safe. It must be used exclusively
 //  on a single queue (typically the render queue during export).
@@ -26,9 +26,8 @@ private extension CGAffineTransform {
 
 /// A pool of reusable CGContext buffers for offscreen rendering.
 ///
-/// During mask rendering, we need temporary buffers for:
-/// - RGBA content (layer content before masking)
-/// - Grayscale mask (mask alpha channel)
+/// Used for RGBA content buffers during mask rendering.
+/// MaskComposer manages its own grayscale buffers separately.
 ///
 /// Creating CGContexts is expensive (~5-20ms each). This pool reuses buffers
 /// to avoid allocation overhead during export.
@@ -54,18 +53,11 @@ public final class ContextPool {
 
     // MARK: - Types
 
-    /// Type of context buffer
-    public enum ContextType {
-        case rgba       // 4 bytes per pixel, for content
-        case mask       // 1 byte per pixel, alpha-only for masks (coverage buffer)
-    }
-
     /// A pooled context with metadata
     private struct PooledContext {
         let context: CGContext
         let width: Int
         let height: Int
-        let type: ContextType
         var inUse: Bool
     }
 
@@ -94,34 +86,48 @@ public final class ContextPool {
 
     /// Gets or creates an RGBA context of the specified size.
     ///
+    /// The context is cleared to fully transparent before returning.
+    ///
     /// - Parameters:
     ///   - width: Width in pixels
     ///   - height: Height in pixels
     /// - Returns: A CGContext ready for drawing, or nil if creation failed
     public func getRGBA(width: Int, height: Int) -> CGContext? {
-        getContext(width: width, height: height, type: .rgba)
-    }
+        // Try to find a reusable context of matching or larger size
+        for i in pool.indices {
+            let pooled = pool[i]
+            if !pooled.inUse &&
+               pooled.width >= width &&
+               pooled.height >= height {
+                // Reuse this context
+                pool[i].inUse = true
+                totalReused += 1
 
-    /// Gets or creates an alpha-only mask context of the specified size.
-    ///
-    /// Alpha-only format is better than grayscale for masks because:
-    /// - opacity = alpha works naturally
-    /// - blendMode operations work correctly (destinationOut, destinationIn)
-    /// - clip(to:mask:) gets correct coverage
-    ///
-    /// - Parameters:
-    ///   - width: Width in pixels
-    ///   - height: Height in pixels
-    /// - Returns: A CGContext ready for drawing, or nil if creation failed
-    public func getMask(width: Int, height: Int) -> CGContext? {
-        getContext(width: width, height: height, type: .mask)
-    }
+                // Clear the context before reuse
+                Self.clearRGBA(pooled.context, width: pooled.width, height: pooled.height)
+                return pooled.context
+            }
+        }
 
-    /// Gets or creates a grayscale context of the specified size.
-    /// @deprecated Use getMask() instead for mask rendering.
-    @available(*, deprecated, message: "Use getMask() for alpha-only mask contexts")
-    public func getGrayscale(width: Int, height: Int) -> CGContext? {
-        getContext(width: width, height: height, type: .mask)
+        // No suitable context found - create new one
+        guard let context = createRGBAContext(width: width, height: height) else {
+            return nil
+        }
+
+        totalCreated += 1
+
+        // Add to pool if not full
+        if pool.count < maxPoolSize {
+            pool.append(PooledContext(
+                context: context,
+                width: width,
+                height: height,
+                inUse: true
+            ))
+            peakPoolSize = max(peakPoolSize, pool.count)
+        }
+
+        return context
     }
 
     /// Returns a context to the pool for reuse.
@@ -144,14 +150,21 @@ public final class ContextPool {
         pool.removeAll()
     }
 
+    /// Logs pool statistics.
+    public func logStats() {
+        print("📦 [ContextPool] Stats:")
+        print("   Created: \(totalCreated)")
+        print("   Reused: \(totalReused)")
+        print("   Peak pool size: \(peakPoolSize)")
+        print("   Current pool size: \(pool.count)")
+        let reuseRate = totalCreated > 0 ? Double(totalReused) / Double(totalCreated + totalReused) * 100 : 0
+        print("   Reuse rate: \(String(format: "%.1f", reuseRate))%")
+    }
+
+    // MARK: - Private
+
     /// Clears an RGBA context to fully transparent.
-    ///
-    /// Use this for content buffers where transparency is needed.
-    /// - Parameters:
-    ///   - ctx: The RGBA context to clear
-    ///   - width: Width of the backing store
-    ///   - height: Height of the backing store
-    public static func clearRGBA(_ ctx: CGContext, width: Int, height: Int) {
+    private static func clearRGBA(_ ctx: CGContext, width: Int, height: Int) {
         ctx.saveGState()
         defer { ctx.restoreGState() }
 
@@ -167,99 +180,7 @@ public final class ContextPool {
         ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
     }
 
-    /// Clears a grayscale mask context to zero coverage (black).
-    ///
-    /// Use this for luminance-based mask buffers.
-    /// In "coverage = luminance" model: black (0) = fully hidden.
-    /// - Parameters:
-    ///   - ctx: The grayscale mask context to clear
-    ///   - width: Width of the backing store
-    ///   - height: Height of the backing store
-    public static func clearMaskLuminance(_ ctx: CGContext, width: Int, height: Int) {
-        ctx.saveGState()
-        defer { ctx.restoreGState() }
-
-        ctx.resetClip()
-        let ctm = ctx.ctm
-        if !ctm.isIdentity, let inv = ctm.invertedIfPossible {
-            ctx.concatenate(inv)
-        }
-
-        ctx.setBlendMode(.copy)
-        // Black = 0 coverage in luminance model
-        ctx.setFillColor(CGColor(gray: 0, alpha: 1))
-        ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
-    }
-
-    /// Logs pool statistics.
-    public func logStats() {
-        print("📦 [ContextPool] Stats:")
-        print("   Created: \(totalCreated)")
-        print("   Reused: \(totalReused)")
-        print("   Peak pool size: \(peakPoolSize)")
-        print("   Current pool size: \(pool.count)")
-        let reuseRate = totalCreated > 0 ? Double(totalReused) / Double(totalCreated + totalReused) * 100 : 0
-        print("   Reuse rate: \(String(format: "%.1f", reuseRate))%")
-    }
-
-    // MARK: - Private
-
-    private func getContext(width: Int, height: Int, type: ContextType) -> CGContext? {
-        // Try to find a reusable context of matching or larger size
-        for i in pool.indices {
-            let pooled = pool[i]
-            if !pooled.inUse &&
-               pooled.type == type &&
-               pooled.width >= width &&
-               pooled.height >= height {
-                // Reuse this context
-                pool[i].inUse = true
-                totalReused += 1
-
-                // Clear the context before reuse using type-appropriate method
-                let ctx = pooled.context
-                switch type {
-                case .rgba:
-                    Self.clearRGBA(ctx, width: pooled.width, height: pooled.height)
-                case .mask:
-                    Self.clearMaskLuminance(ctx, width: pooled.width, height: pooled.height)
-                }
-
-                return ctx
-            }
-        }
-
-        // No suitable context found - create new one
-        guard let context = createContext(width: width, height: height, type: type) else {
-            return nil
-        }
-
-        totalCreated += 1
-
-        // Add to pool if not full
-        if pool.count < maxPoolSize {
-            pool.append(PooledContext(
-                context: context,
-                width: width,
-                height: height,
-                type: type,
-                inUse: true
-            ))
-            peakPoolSize = max(peakPoolSize, pool.count)
-        }
-
-        return context
-    }
-
-    private func createContext(width: Int, height: Int, type: ContextType) -> CGContext? {
-        switch type {
-        case .rgba:
-            return createRGBAContext(width: width, height: height)
-        case .mask:
-            return createMaskContext(width: width, height: height)
-        }
-    }
-
+    /// Creates an RGBA context for content rendering.
     private func createRGBAContext(width: Int, height: Int) -> CGContext? {
         let colorSpace = CGColorSpaceCreateDeviceRGB()
         let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue)
@@ -274,39 +195,5 @@ public final class ContextPool {
             space: colorSpace,
             bitmapInfo: bitmapInfo.rawValue
         )
-    }
-
-    /// Creates a grayscale context for mask rendering (1 byte per pixel, no alpha).
-    ///
-    /// We use "Мир 2: coverage = luminance" model:
-    /// - clip(to:mask:) reads LUMINANCE (gray channel) for coverage
-    /// - black (0) = fully hidden, white (1) = fully visible
-    /// - Draw with setFillColor(gray: coverage, alpha: 1)
-    /// - Porter-Duff blendModes (destinationOut, etc.) work on gray values
-    ///
-    /// This is the most stable approach because:
-    /// - No alpha/luminance ambiguity
-    /// - Predictable behavior with clip(to:mask:)
-    /// - 1 byte per pixel = smaller buffers, faster operations
-    private func createMaskContext(width: Int, height: Int) -> CGContext? {
-        let colorSpace = CGColorSpaceCreateDeviceGray()
-
-        let ctx = CGContext(
-            data: nil,
-            width: width,
-            height: height,
-            bitsPerComponent: 8,
-            bytesPerRow: width,  // 1 byte per pixel (grayscale, no alpha)
-            space: colorSpace,
-            bitmapInfo: CGImageAlphaInfo.none.rawValue
-        )
-
-        #if DEBUG
-        if ctx == nil {
-            print("⚠️ [ContextPool] createMaskContext FAILED: \(width)x\(height)")
-        }
-        #endif
-
-        return ctx
     }
 }

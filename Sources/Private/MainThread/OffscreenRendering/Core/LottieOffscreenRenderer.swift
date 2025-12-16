@@ -58,11 +58,11 @@ public final class LottieOffscreenRenderer {
     /// Provider for image/video frames (owned by this renderer)
     private let layerImageProvider: LayerImageProvider
 
-    /// Pool of reusable CGContext buffers for mask rendering
+    /// Pool of reusable CGContext buffers for content rendering
     private let contextPool = ContextPool()
 
-    /// Composer for combining multiple masks with correct Porter-Duff operations
-    private lazy var maskComposer = MaskComposer(contextPool: contextPool)
+    /// Composer for combining multiple masks using pixel math
+    private let maskComposer = MaskComposer()
 
     // MARK: - Metrics (for debugging/profiling)
 
@@ -435,14 +435,12 @@ public final class LottieOffscreenRenderer {
         let contentBounds = computeLayerLocalContentBounds(layer)
         let maskBounds = calculateMaskBounds(masks)
 
-        let layerName = layer.keypathName ?? "?"
-
         // Safety: if masks empty or bounds invalid, fall back to content bounds
         var cropRect: CGRect
         if masks.isEmpty || maskBounds.isNull || maskBounds.isEmpty {
             cropRect = contentBounds
         } else {
-            // These cases can reveal content OUTSIDE the shape area,
+            // Subtract/Inverted masks reveal content OUTSIDE the shape area,
             // so intersect-cropping would discard visible pixels.
             let hasSubtractLike = masks.contains {
                 $0.mode == .subtract || $0.mode == .darken
@@ -455,31 +453,8 @@ public final class LottieOffscreenRenderer {
             cropRect = needsFullBounds ? contentBounds : contentBounds.intersection(maskBounds)
         }
 
-        // 🔥 DEBUG: Log for ALL masked layers on frame 0
-        let frameInt = Int(frame)
-        if frameInt == 0 {
-            print("🔥 [MASK-DIAG] layer='\(layerName)' masks=\(masks.count)")
-            print("🔥 [MASK-DIAG]   contentBounds=\(contentBounds)")
-            print("🔥 [MASK-DIAG]   maskBounds=\(maskBounds)")
-            print("🔥 [MASK-DIAG]   cropRect=\(cropRect)")
-            if !masks.isEmpty {
-                print("🔥 [MASK-DIAG]   masks[0].mode=\(masks[0].mode) inverted=\(masks[0].inverted)")
-            }
-            // Check if this is an ImageCompositionLayer and if image is nil
-            if let imageLayer = layer as? ImageCompositionLayer {
-                let hasImage = imageLayer.image != nil
-                print("🔥 [MASK-DIAG]   ImageLayer: image=\(hasImage ? "present" : "NIL!")")
-            }
-        }
-
         // Guard against empty or invalid rect
         if cropRect.isNull || cropRect.isEmpty || cropRect.width < 1 || cropRect.height < 1 {
-            // Mask doesn't intersect content - nothing to render
-            #if DEBUG
-            print("   ⚠️ SKIP render - cropRect invalid for '\(layer.keypathName ?? "?")'")
-            print("      contentBounds: \(contentBounds)")
-            print("      maskBounds: \(maskBounds)")
-            #endif
             return
         }
 
@@ -491,8 +466,7 @@ public final class LottieOffscreenRenderer {
 
         // 2. Get content buffer from pool
         guard let contentCtx = contextPool.getRGBA(width: width, height: height) else {
-            // Fallback: render without mask if we can't get buffer
-            print("⚠️ [LottieOffscreenRenderer] Failed to get content buffer for mask, rendering without mask")
+            // Fallback: render without mask
             let renderCtx = RenderContext(cg: cg, state: state, frame: frame)
             renderLayerContent(layer, ctx: renderCtx)
             return
@@ -507,11 +481,10 @@ public final class LottieOffscreenRenderer {
         renderLayerContent(layer, ctx: contentRenderCtx)
         contentCtx.restoreGState()
 
-        // 4. Compose masks using MaskComposer (handles Add/Subtract/Intersect correctly)
+        // 4. Compose masks using pixel math (exact AE semantics)
         let offset = CGPoint(x: -cropRect.origin.x, y: -cropRect.origin.y)
         guard let maskImage = maskComposer.compose(masks: masks, width: width, height: height, offset: offset) else {
-            print("⚠️ [LottieOffscreenRenderer] MaskComposer failed, rendering without mask")
-            // Fallback: get content and draw without mask
+            // Fallback: render content without mask
             if let contentImage = contentCtx.makeImage()?.cropping(to: CGRect(x: 0, y: 0, width: width, height: height)) {
                 let destRect = CGRect(x: cropRect.origin.x, y: cropRect.origin.y, width: CGFloat(width), height: CGFloat(height))
                 cg.saveGState()
@@ -522,48 +495,16 @@ public final class LottieOffscreenRenderer {
             return
         }
 
-        // 5. Get content image and crop to requested size
+        // 5. Get content image
         let cropRegion = CGRect(x: 0, y: 0, width: width, height: height)
         guard let fullContent = contentCtx.makeImage(),
               let contentImage = fullContent.cropping(to: cropRegion) else {
-            print("⚠️ [LottieOffscreenRenderer] Failed to create content image")
             return
         }
 
-        // 6. Composite onto main context
-        // Main context already has globalTransform applied, so we draw at cropRect origin
-        // in local coords. clip(to:mask:) uses mask alpha to determine visibility.
+        // 6. Composite: clip with mask, then draw content
+        // clip(to:mask:) semantics: white (255) = visible, black (0) = hidden
         let destRect = CGRect(x: cropRect.origin.x, y: cropRect.origin.y, width: CGFloat(width), height: CGFloat(height))
-
-        // 🔥 DEBUG: Log mask and content info for ALL masked layers on frame 0
-        if frameInt == 0 {
-            print("🔥 [MASK-DIAG] '\(layerName)' destRect=\(destRect)")
-            print("🔥 [MASK-DIAG] '\(layerName)' maskImage: \(maskImage.width)x\(maskImage.height) bpp=\(maskImage.bitsPerPixel)")
-            print("🔥 [MASK-DIAG] '\(layerName)' contentImage: \(contentImage.width)x\(contentImage.height) bpp=\(contentImage.bitsPerPixel)")
-
-            // Sample mask pixels
-            if let dataProvider = maskImage.dataProvider,
-               let data = dataProvider.data,
-               let bytes = CFDataGetBytePtr(data) {
-                let bytesPerRow = maskImage.bytesPerRow
-                let cornerIdx = 10 * bytesPerRow + 10
-                let centerIdx = (maskImage.height / 2) * bytesPerRow + (maskImage.width / 2)
-                print("🔥 [MASK-DIAG] '\(layerName)' mask corner(10,10)=\(bytes[cornerIdx]) center=\(bytes[centerIdx])")
-            }
-
-            // Sample content pixels to verify it's not empty
-            if let dataProvider = contentImage.dataProvider,
-               let data = dataProvider.data,
-               let bytes = CFDataGetBytePtr(data) {
-                let bytesPerRow = contentImage.bytesPerRow
-                let centerIdx = (contentImage.height / 2) * bytesPerRow + (contentImage.width / 2) * 4
-                let r = bytes[centerIdx]
-                let g = bytes[centerIdx + 1]
-                let b = bytes[centerIdx + 2]
-                let a = bytes[centerIdx + 3]
-                print("🔥 [MASK-DIAG] '\(layerName)' content center RGBA=(\(r),\(g),\(b),\(a))")
-            }
-        }
 
         cg.saveGState()
         cg.setAlpha(state.alpha)
@@ -783,6 +724,7 @@ public final class LottieOffscreenRenderer {
     /// Clears cached resources. Call after export completes.
     public func clearCaches() {
         contextPool.clear()
+        maskComposer.clearCaches()
     }
 }
 

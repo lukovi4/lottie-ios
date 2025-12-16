@@ -3,7 +3,7 @@
 //  lottie-ios
 //
 //  Created for Animi offscreen rendering support.
-//  Composes multiple masks using Porter-Duff operations for correct Lottie semantics.
+//  Composes multiple masks using pixel math for correct Lottie/AE semantics.
 //
 //  IMPORTANT: This class is NOT thread-safe. It must be used exclusively
 //  on a single queue (typically the render queue during export).
@@ -13,25 +13,25 @@ import CoreGraphics
 
 // MARK: - MaskComposer
 
-/// Composes multiple masks into a single alpha coverage buffer.
+/// Composes multiple masks into a single coverage buffer using pixel math.
 ///
-/// This implements the correct Lottie mask semantics using raw shape paths:
-/// - **Add**: Union coverage — draw shape with `.normal` blend
-/// - **Add + inverted**: Show everything except shape — fill full rect, then `.destinationOut` shape
-/// - **Subtract**: Remove coverage — `.destinationOut` on shape
-/// - **Subtract + inverted**: Remove everything except shape — complex case
-/// - **Intersect**: Keep only intersection — `.destinationIn` via temp buffer
+/// ## Key Principle: Coverage = Luminance
+/// We use DeviceGray (1 byte per pixel, no alpha) for masks.
+/// - 0 (black) = fully hidden
+/// - 255 (white) = fully visible
+/// - opacity is encoded in gray value, NOT alpha
 ///
-/// ## Important
-/// This class works with `MaskSnapshot.shapePath` (raw path without veryLargeRect),
-/// NOT with `bakedPath`. The inversion logic is handled explicitly here.
+/// ## Mask Mode Math (equivalent to After Effects)
+/// - **Add**: `dst = max(dst, src)`
+/// - **Subtract**: `dst = dst * (1 - src) / 255`
+/// - **Intersect**: `dst = min(dst, src)`
+/// - **Inverted**: `src = 255 - src` (applied before mode)
 ///
-/// ## Usage
-/// ```swift
-/// let composer = MaskComposer(contextPool: pool)
-/// let maskImage = composer.compose(masks: masks, width: w, height: h, offset: pt)
-/// // Use maskImage with CGContext.clip(to:mask:)
-/// ```
+/// ## Why Pixel Math Instead of CGBlendMode
+/// - CGBlendMode behavior with grayscale contexts is undefined/inconsistent
+/// - Pixel math gives exact AE semantics
+/// - Easy to debug (can dump buffers)
+/// - No CoreGraphics quirks
 ///
 /// ## Thread Safety
 /// This class is NOT thread-safe. Use only from a single queue.
@@ -40,27 +40,33 @@ public final class MaskComposer {
 
     // MARK: - Properties
 
-    /// Pool for getting mask buffers
-    private let contextPool: ContextPool
+    /// Accumulator buffer (dst) - reused between compose() calls
+    private var accBuffer: [UInt8] = []
+
+    /// Source buffer for single mask - reused between masks
+    private var srcBuffer: [UInt8] = []
+
+    /// CGContext that draws into srcBuffer - reused
+    private var srcContext: CGContext?
+
+    /// Current buffer dimensions
+    private var bufferWidth: Int = 0
+    private var bufferHeight: Int = 0
 
     // MARK: - Initialization
 
-    /// Creates a new mask composer.
-    /// - Parameter contextPool: Pool for allocating temporary buffers
-    public init(contextPool: ContextPool) {
-        self.contextPool = contextPool
-    }
+    public init() {}
 
     // MARK: - Public API
 
-    /// Composes multiple masks into a single alpha coverage image.
+    /// Composes multiple masks into a single grayscale coverage image.
     ///
     /// - Parameters:
     ///   - masks: Array of MaskSnapshot with resolved paths
     ///   - width: Width of the mask buffer
     ///   - height: Height of the mask buffer
     ///   - offset: Translation offset for rendering (typically -cropRect.origin)
-    /// - Returns: CGImage with alpha coverage, or nil if composition failed
+    /// - Returns: CGImage with grayscale coverage, or nil if composition failed
     public func compose(
         masks: [MaskSnapshot],
         width: Int,
@@ -69,265 +75,170 @@ public final class MaskComposer {
     ) -> CGImage? {
         guard !masks.isEmpty, width > 0, height > 0 else { return nil }
 
-        // Get accumulator buffer from pool
-        guard let accCtx = contextPool.getMask(width: width, height: height) else {
-            return nil
-        }
-        defer { contextPool.release(accCtx) }
+        // Ensure buffers are allocated/resized
+        ensureBuffers(width: width, height: height)
 
         // Determine initial coverage based on first mask
-        // - Add (non-inverted): start empty, add shape coverage
-        // - Subtract / Intersect / Inverted: start full, then modify
-        let firstMask = masks[0]
-        let needsFullInitialCoverage = firstMask.mode == .subtract ||
-                                        firstMask.mode == .darken ||
-                                        firstMask.mode == .intersect ||
-                                        firstMask.mode == .difference ||
-                                        firstMask.inverted
+        let first = masks[0]
+        let needsFullInitial = first.mode == .subtract ||
+                               first.mode == .darken ||
+                               first.mode == .intersect ||
+                               first.mode == .difference ||
+                               first.inverted
 
-        // 🔥 DEBUG: Log mask details — REMOVED for cleaner logs
-
-        if needsFullInitialCoverage {
-            // Fill accumulator with full coverage (alpha = 1)
-            initializeAccumulatorFull(accCtx, width: width, height: height)
+        // Initialize accumulator
+        if needsFullInitial {
+            // Start with full coverage (white)
+            accBuffer.withUnsafeMutableBytes { ptr in
+                memset(ptr.baseAddress, 255, width * height)
+            }
         } else {
-            // Clear accumulator to transparent (0 coverage)
-            ContextPool.clearMaskLuminance(accCtx, width: width, height: height)
+            // Start with zero coverage (black)
+            accBuffer.withUnsafeMutableBytes { ptr in
+                memset(ptr.baseAddress, 0, width * height)
+            }
         }
 
-        // Apply translation offset
-        accCtx.saveGState()
-        accCtx.translateBy(x: offset.x, y: offset.y)
-
-        // Compose all masks with their actual modes
+        // Compose each mask
         for mask in masks {
-            composeMask(mask, into: accCtx, width: width, height: height, offset: offset)
+            renderMaskToSrcBuffer(mask, offset: offset)
+            composeCoverage(mode: mask.mode, inverted: mask.inverted)
         }
 
-        accCtx.restoreGState()
-
-        // Extract grayscale image from accumulator
-        guard let fullImage = accCtx.makeImage() else { return nil }
-
-        #if DEBUG
-        // Debug: sample raw grayscale pixels
-        if let provider = fullImage.dataProvider,
-           let data = provider.data,
-           let bytes = CFDataGetBytePtr(data) {
-            let bpr = fullImage.bytesPerRow
-            let cornerIdx = 10 * bpr + 10
-            let centerIdx = (fullImage.height / 2) * bpr + (fullImage.width / 2)
-            print("🔥 [MaskComposer] grayscale mask:")
-            print("🔥   corner(10,10)=\(bytes[cornerIdx]) center=\(bytes[centerIdx])")
-            print("🔥   For clip(to:mask:): white(255)=visible, black(0)=hidden")
-        }
-        #endif
-
-        let cropRegion = CGRect(x: 0, y: 0, width: width, height: height)
-        guard let croppedImage = fullImage.cropping(to: cropRegion) else { return nil }
-
-        // Return grayscale CGImage directly for clip(to:mask:)
-        // clip(to:mask:) semantics for grayscale images:
-        // - white (255) = fully visible
-        // - black (0) = fully hidden
-        // This matches our "coverage = luminance" model
-        return croppedImage
+        // Create CGImage from accumulator
+        return createImageFromAccumulator(width: width, height: height)
     }
 
-    /// Fills the accumulator with full coverage (alpha = 1).
-    /// Used when first mask is subtract/intersect/inverted.
-    private func initializeAccumulatorFull(_ ctx: CGContext, width: Int, height: Int) {
+    /// Clears cached buffers. Call after export to free memory.
+    public func clearCaches() {
+        accBuffer = []
+        srcBuffer = []
+        srcContext = nil
+        bufferWidth = 0
+        bufferHeight = 0
+    }
+
+    // MARK: - Private: Buffer Management
+
+    /// Ensures buffers are allocated with correct size.
+    private func ensureBuffers(width: Int, height: Int) {
+        let size = width * height
+
+        // Reallocate if size changed
+        if bufferWidth != width || bufferHeight != height {
+            accBuffer = [UInt8](repeating: 0, count: size)
+            srcBuffer = [UInt8](repeating: 0, count: size)
+            srcContext = nil // Force recreation
+            bufferWidth = width
+            bufferHeight = height
+        }
+
+        // Create srcContext if needed (draws directly into srcBuffer)
+        if srcContext == nil {
+            srcBuffer.withUnsafeMutableBytes { ptr in
+                srcContext = CGContext(
+                    data: ptr.baseAddress,
+                    width: width,
+                    height: height,
+                    bitsPerComponent: 8,
+                    bytesPerRow: width,
+                    space: CGColorSpaceCreateDeviceGray(),
+                    bitmapInfo: CGImageAlphaInfo.none.rawValue
+                )
+            }
+        }
+    }
+
+    // MARK: - Private: Mask Rendering
+
+    /// Renders a single mask shape into srcBuffer.
+    private func renderMaskToSrcBuffer(_ mask: MaskSnapshot, offset: CGPoint) {
+        guard let ctx = srcContext else { return }
+
+        // Clear srcBuffer to black (0 coverage)
+        srcBuffer.withUnsafeMutableBytes { ptr in
+            memset(ptr.baseAddress, 0, bufferWidth * bufferHeight)
+        }
+
         ctx.saveGState()
         defer { ctx.restoreGState() }
 
-        // Reset any transforms
-        ctx.resetClip()
-        let ctm = ctx.ctm
-        if !ctm.isIdentity {
-            let det = ctm.a * ctm.d - ctm.b * ctm.c
-            if abs(det) > 1e-12 {
-                ctx.concatenate(ctm.inverted())
-            }
-        }
+        // Apply offset (typically -cropRect.origin)
+        ctx.translateBy(x: offset.x, y: offset.y)
 
-        // Fill with full coverage
-        ctx.setBlendMode(.copy)
-        ctx.setFillColor(CGColor(gray: 1, alpha: 1))
-        ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
-    }
-
-    // MARK: - Private
-
-    /// Composes a single mask into the accumulator context.
-    ///
-    /// Uses raw `shapePath` and applies mode/inverted logic explicitly.
-    /// Accumulator must be pre-initialized (empty or full) based on first mask.
-    private func composeMask(
-        _ mask: MaskSnapshot,
-        into accCtx: CGContext,
-        width: Int,
-        height: Int,
-        offset: CGPoint
-    ) {
-        switch mask.mode {
-        case .add, .lighten:
-            if mask.inverted {
-                // Inverted Add: show everything EXCEPT the shape
-                // Fill full coverage, then cut out shape
-                composeInvertedAdd(mask, into: accCtx, width: width, height: height, offset: offset)
-            } else {
-                // Normal Add: draw shape coverage (union)
-                drawShapePath(mask, into: accCtx, blendMode: .normal)
-            }
-
-        case .subtract, .darken:
-            if mask.inverted {
-                // Inverted Subtract: keep only the shape area
-                // This is equivalent to intersect with shape
-                composeIntersect(mask, into: accCtx, width: width, height: height, offset: offset)
-            } else {
-                // Normal Subtract: remove shape from coverage
-                // destinationOut: dst = dst * (1 - src.alpha)
-                drawShapePath(mask, into: accCtx, blendMode: .destinationOut)
-            }
-
-        case .intersect, .difference:
-            if mask.inverted {
-                // Inverted Intersect: keep only where shape is NOT
-                // This is subtract semantics
-                drawShapePath(mask, into: accCtx, blendMode: .destinationOut)
-            } else {
-                // Normal Intersect: keep only where both have coverage
-                composeIntersect(mask, into: accCtx, width: width, height: height, offset: offset)
-            }
-
-        case .none:
-            // Skip masks with mode .none
-            break
-        }
-    }
-
-    /// Draws the raw shape path into the context with specified blend mode.
-    ///
-    /// Uses `shapePath` (raw path without veryLargeRect inversion).
-    ///
-    /// We use "coverage = luminance" model:
-    /// - clip(to:mask:) reads gray channel for coverage
-    /// - gray=0 (black) = fully hidden
-    /// - gray=1 (white) = fully visible
-    /// - gray=opacity encodes partial coverage
-    private func drawShapePath(
-        _ mask: MaskSnapshot,
-        into ctx: CGContext,
-        blendMode: CGBlendMode
-    ) {
-        ctx.saveGState()
-        defer { ctx.restoreGState() }
-
-        ctx.setBlendMode(blendMode)
-
-        // Coverage = luminance model:
-        // gray = mask.opacity encodes coverage (0 = hidden, 1 = visible)
-        // alpha = 1 ensures the fill actually applies
+        // Draw shape with opacity encoded as gray value
+        // gray = opacity means: 0 = transparent, 1 = opaque coverage
         ctx.setFillColor(CGColor(gray: mask.opacity, alpha: 1))
         ctx.addPath(mask.shapePath)
         ctx.fillPath(using: mask.fillRule)
     }
 
-    /// Composes an inverted Add mask.
+    // MARK: - Private: Pixel Math Composition
+
+    /// Composes srcBuffer into accBuffer using pixel math.
     ///
-    /// Algorithm:
-    /// 1. Fill entire bounds with coverage
-    /// 2. Cut out the shape using destinationOut
-    /// Result: coverage everywhere EXCEPT the shape
-    private func composeInvertedAdd(
-        _ mask: MaskSnapshot,
-        into accCtx: CGContext,
-        width: Int,
-        height: Int,
-        offset: CGPoint
-    ) {
-        accCtx.saveGState()
-        defer { accCtx.restoreGState() }
+    /// This is the core of mask composition - exact AE semantics:
+    /// - Add: max(dst, src)
+    /// - Subtract: dst * (1 - src) / 255
+    /// - Intersect: min(dst, src)
+    private func composeCoverage(mode: MaskMode, inverted: Bool) {
+        let count = bufferWidth * bufferHeight
 
-        // First: fill full rect with coverage (using normal blend to add to existing)
-        // Coverage = luminance: gray=opacity for partial coverage
-        accCtx.setBlendMode(.normal)
-        accCtx.setFillColor(CGColor(gray: mask.opacity, alpha: 1))
+        for i in 0..<count {
+            var s = Int(srcBuffer[i])
 
-        // We need to fill the shape bounds in layer coordinates
-        // The context already has offset applied, so fill the shapeBounds
-        let boundsRect = mask.shapeBounds
-        accCtx.fill(boundsRect)
+            // Apply inversion first
+            if inverted {
+                s = 255 - s
+            }
 
-        // Second: cut out the shape
-        // Coverage = luminance: gray=1 (white) for full removal
-        accCtx.setBlendMode(.destinationOut)
-        accCtx.setFillColor(CGColor(gray: 1, alpha: 1))
-        accCtx.addPath(mask.shapePath)
-        accCtx.fillPath(using: mask.fillRule)
+            let d = Int(accBuffer[i])
+
+            let result: Int
+            switch mode {
+            case .add, .lighten:
+                // Union: max(dst, src)
+                result = max(d, s)
+
+            case .subtract, .darken:
+                // Remove: dst * (1 - src/255) = dst * (255 - src) / 255
+                result = (d * (255 - s)) / 255
+
+            case .intersect, .difference:
+                // Intersection: min(dst, src)
+                result = min(d, s)
+
+            case .none:
+                // Skip this mask
+                result = d
+            }
+
+            accBuffer[i] = UInt8(clamping: result)
+        }
     }
 
-    /// Composes an intersect mask using a temporary buffer.
-    ///
-    /// Algorithm:
-    /// 1. Render mask shape into temp buffer
-    /// 2. Draw temp buffer onto accumulator with destinationIn blend
-    /// 3. Result: acc = acc AND temp (intersection)
-    private func composeIntersect(
-        _ mask: MaskSnapshot,
-        into accCtx: CGContext,
-        width: Int,
-        height: Int,
-        offset: CGPoint
-    ) {
-        // Get temp buffer for this mask
-        guard let tmpCtx = contextPool.getMask(width: width, height: height) else {
-            #if DEBUG
-            print("⚠️ [MaskComposer] Failed to get temp buffer for intersect, falling back to add")
-            #endif
-            // Fallback to add if we can't get temp buffer
-            drawShapePath(mask, into: accCtx, blendMode: .normal)
-            return
-        }
-        defer { contextPool.release(tmpCtx) }
+    // MARK: - Private: Image Creation
 
-        // Clear temp to transparent
-        ContextPool.clearMaskLuminance(tmpCtx, width: width, height: height)
-
-        // Draw mask shape into temp buffer
-        tmpCtx.saveGState()
-        tmpCtx.translateBy(x: offset.x, y: offset.y)
-        drawShapePath(mask, into: tmpCtx, blendMode: .normal)
-        tmpCtx.restoreGState()
-
-        // Get image from temp buffer
-        guard let fullTmpImage = tmpCtx.makeImage() else {
-            #if DEBUG
-            print("⚠️ [MaskComposer] Failed to create temp image for intersect")
-            #endif
-            return
+    /// Creates a CGImage from the accumulator buffer.
+    private func createImageFromAccumulator(width: Int, height: Int) -> CGImage? {
+        // Create data provider from accumulator
+        guard let provider = CGDataProvider(data: Data(accBuffer) as CFData) else {
+            return nil
         }
 
-        let cropRegion = CGRect(x: 0, y: 0, width: width, height: height)
-        guard let tmpImage = fullTmpImage.cropping(to: cropRegion) else { return }
-
-        // Draw temp onto accumulator with destinationIn
-        // destinationIn: dst = dst * src.alpha (keeps only where both have coverage)
-        accCtx.saveGState()
-
-        // Reset translation for drawing the composited image
-        let ctm = accCtx.ctm
-        if !ctm.isIdentity {
-            let det = ctm.a * ctm.d - ctm.b * ctm.c
-            if abs(det) > 1e-12 {
-                accCtx.concatenate(ctm.inverted())
-            }
-        }
-
-        accCtx.setBlendMode(.destinationIn)
-        accCtx.draw(tmpImage, in: cropRegion)
-        accCtx.restoreGState()
+        return CGImage(
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bitsPerPixel: 8,
+            bytesPerRow: width,
+            space: CGColorSpaceCreateDeviceGray(),
+            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
+            provider: provider,
+            decode: nil,
+            shouldInterpolate: false,
+            intent: .defaultIntent
+        )
     }
 }
 
@@ -335,7 +246,19 @@ public final class MaskComposer {
 
 #if DEBUG
 extension MaskComposer {
-    /// Logs mask composition details for debugging.
+    /// Saves the current accumulator as PNG for debugging.
+    public func saveAccumulatorDebugImage(to url: URL, width: Int, height: Int) {
+        guard let image = createImageFromAccumulator(width: width, height: height),
+              let dest = CGImageDestinationCreateWithURL(url as CFURL, "public.png" as CFString, 1, nil) else {
+            print("⚠️ [MaskComposer] Failed to create debug image destination")
+            return
+        }
+        CGImageDestinationAddImage(dest, image, nil)
+        CGImageDestinationFinalize(dest)
+        print("✅ [MaskComposer] Saved debug mask to \(url.path)")
+    }
+
+    /// Logs mask composition details.
     public static func logMasks(_ masks: [MaskSnapshot], label: String = "Masks") {
         print("🎭 [\(label)] count=\(masks.count)")
         for (i, mask) in masks.enumerated() {
