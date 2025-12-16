@@ -166,6 +166,10 @@ public final class ContextPool {
 
                 ctx.restoreGState()
 
+                // Reset to normal state for next user
+                ctx.setBlendMode(.normal)
+                ctx.setAlpha(1)
+
                 return ctx
             }
         }
