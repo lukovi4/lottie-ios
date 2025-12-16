@@ -172,10 +172,9 @@ public final class LottieOffscreenRenderer {
         // 2. Calculate frame number
         let frame = seconds * framerate
 
-        // 3. Update ALL layer states recursively (transforms, visibility, masks, etc.)
-        // This ensures precomp children and masks are updated before render
+        // 3. Update all layer states (transforms, visibility, etc.)
         for layer in animationLayers {
-            updateLayerTree(layer, frame: frame)
+            layer.displayWithFrame(frame: frame, forceUpdates: true)
         }
 
         // 4. Render all layers in correct order (unified traversal)
@@ -190,18 +189,6 @@ public final class LottieOffscreenRenderer {
         // Update metrics
         framesRendered += 1
         totalRenderTime += CACurrentMediaTime() - startTime
-    }
-
-    /// Recursively updates all layers in the tree to the specified frame.
-    /// This ensures precomp children, masks, and nested layers are all synchronized.
-    private func updateLayerTree(_ layer: CompositionLayer, frame: CGFloat) {
-        layer.displayWithFrame(frame: frame, forceUpdates: true)
-
-        if let precomp = layer as? PreCompositionLayer {
-            for child in precomp.animationLayers {
-                updateLayerTree(child, frame: frame)
-            }
-        }
     }
 
     // MARK: - Unified Layer Traversal
@@ -224,8 +211,18 @@ public final class LottieOffscreenRenderer {
         into cg: CGContext,
         state: RenderState
     ) {
-        // Visibility check: trust Lottie's runtime state (handles ip/op/st/timeStretch correctly)
-        // Lottie sets isHidden based on ip/op/st/timeStretch, so we don't need manual gating
+        // 0) IP/OP gating — don't render layers outside their visibility range
+        let ip = layer.inFrame
+        let op = layer.outFrame
+        if op > ip {
+            let eps: CGFloat = 0.0001
+            if frame + eps < ip || frame >= op - eps { return }
+        } else {
+            // Broken timing data, skip layer
+            return
+        }
+
+        // 1) Runtime hidden check
         guard !layer.contentsLayer.isHidden else { return }
 
         cg.saveGState()
@@ -524,37 +521,29 @@ public final class LottieOffscreenRenderer {
     ///   - bufferSize: Size of the buffer (for initial black fill)
     ///
     private func renderMasksToGrayscale(_ masks: [MaskSnapshot], into ctx: CGContext, bufferSize: CGSize) {
-        // For CGContext.clip(to:mask:) with grayscale image (no alpha channel):
-        // - Black (0) = painting ALLOWED (visible)
-        // - White (1) = painting BLOCKED (masked)
-        // Formula: alpha = 1 - S, where S is sample value
-        //
-        // So for Add mask with opacity:
-        // - opacity 0% → should be fully masked → white (1)
-        // - opacity 100% → should be fully visible → black (0)
-        // Therefore: gray = 1 - opacity
-
-        // Start with white (fully masked / nothing visible)
-        ctx.setFillColor(gray: 1, alpha: 1)
+        // Start with black (fully masked) - fill only the buffer area
+        ctx.setFillColor(gray: 0, alpha: 1)
         ctx.fill(CGRect(origin: .zero, size: bufferSize))
 
         // Render each mask
+        // IMPORTANT: Grayscale context has no alpha channel (CGImageAlphaInfo.none),
+        // so we encode opacity directly into the gray value (0=masked, 1=visible).
+        // clip(to:mask:) uses pixel brightness as alpha.
         for mask in masks {
             #if DEBUG
             print("   🎨 mask.opacity=\(mask.opacity) mode=\(mask.mode)")
             #endif
             switch mask.mode {
             case .add:
-                // Add mode: reveal content where mask is
-                // gray = 1 - opacity (0% → white/masked, 100% → black/visible)
-                ctx.setFillColor(gray: 1.0 - mask.opacity, alpha: 1)
+                // Add mode: gray = opacity (0% opacity → black, 100% → white)
+                ctx.setFillColor(gray: mask.opacity, alpha: 1)
                 ctx.addPath(mask.path)
                 ctx.fillPath(using: .evenOdd)
 
             case .subtract:
-                // Subtract: hide content where mask is
-                // gray = opacity (0% → black/visible, 100% → white/masked)
-                ctx.setFillColor(gray: mask.opacity, alpha: 1)
+                // Subtract: path already contains veryLargeRect with evenOdd
+                // Fill with black to subtract (inverse of opacity)
+                ctx.setFillColor(gray: 1.0 - mask.opacity, alpha: 1)
                 ctx.addPath(mask.path)
                 ctx.fillPath(using: .evenOdd)
 
@@ -564,7 +553,7 @@ public final class LottieOffscreenRenderer {
                 #if DEBUG
                 print("⚠️ [LottieOffscreenRenderer] Intersect mask mode not fully implemented, treating as Add")
                 #endif
-                ctx.setFillColor(gray: 1.0 - mask.opacity, alpha: 1)
+                ctx.setFillColor(gray: mask.opacity, alpha: 1)
                 ctx.addPath(mask.path)
                 ctx.fillPath(using: .evenOdd)
 
