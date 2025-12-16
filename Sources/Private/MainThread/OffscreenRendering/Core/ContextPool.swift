@@ -147,8 +147,24 @@ public final class ContextPool {
                 totalReused += 1
 
                 // Clear the context before reuse
+                // IMPORTANT: Reset CTM to identity before clearing to ensure we clear
+                // the entire backing store regardless of any leftover transforms
                 let ctx = pooled.context
-                ctx.clear(CGRect(x: 0, y: 0, width: pooled.width, height: pooled.height))
+                ctx.saveGState()
+
+                // Reset CTM to identity by applying inverse of current transform
+                let currentCTM = ctx.ctm
+                if !currentCTM.isIdentity {
+                    let inverse = currentCTM.inverted()
+                    ctx.concatenate(inverse)
+                }
+
+                // Clear using .copy blend mode to guarantee full overwrite
+                ctx.setBlendMode(.copy)
+                ctx.setFillColor(CGColor(gray: 0, alpha: 0))
+                ctx.fill(CGRect(x: 0, y: 0, width: pooled.width, height: pooled.height))
+
+                ctx.restoreGState()
 
                 return ctx
             }

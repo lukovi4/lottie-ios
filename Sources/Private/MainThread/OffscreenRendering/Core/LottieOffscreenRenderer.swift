@@ -453,19 +453,21 @@ public final class LottieOffscreenRenderer {
             contextPool.release(maskCtx)
         }
 
-        // 3. Setup content context with offset for crop
-        // We render in layer's local space, offset by cropRect origin
+        // 3. Render layer content into RGBA buffer
+        // IMPORTANT: Wrap translateBy in saveGState/restoreGState to not pollute pooled context
+        contentCtx.saveGState()
         contentCtx.translateBy(x: -cropRect.origin.x, y: -cropRect.origin.y)
-
-        // 4. Render layer content into RGBA buffer
-        // Create RenderContext with alpha=1.0 for offscreen, we'll apply layer alpha when compositing
         let offscreenState = RenderState(alpha: 1.0)
         let contentRenderCtx = RenderContext(cg: contentCtx, state: offscreenState, frame: frame)
         renderLayerContent(layer, ctx: contentRenderCtx)
+        contentCtx.restoreGState()
 
-        // 5. Render masks into grayscale buffer
+        // 4. Render masks into grayscale buffer
+        // IMPORTANT: Wrap translateBy in saveGState/restoreGState to not pollute pooled context
+        maskCtx.saveGState()
         maskCtx.translateBy(x: -cropRect.origin.x, y: -cropRect.origin.y)
         renderMasksToGrayscale(masks, into: maskCtx, bufferSize: CGSize(width: width, height: height))
+        maskCtx.restoreGState()
 
         // 6. Get images from buffers
         guard let contentImage = contentCtx.makeImage(),
