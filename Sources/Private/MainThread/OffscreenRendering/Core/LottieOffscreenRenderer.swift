@@ -530,6 +530,9 @@ public final class LottieOffscreenRenderer {
         // so we encode opacity directly into the gray value (0=masked, 1=visible).
         // clip(to:mask:) uses pixel brightness as alpha.
         for mask in masks {
+            #if DEBUG
+            print("   🎨 mask.opacity=\(mask.opacity) mode=\(mask.mode)")
+            #endif
             switch mask.mode {
             case .add:
                 // Add mode: gray = opacity (0% opacity → black, 100% → white)
