@@ -219,12 +219,13 @@ public final class LottieOffscreenRenderer {
         // DEBUG: Точечный лог для Media слоёв на кадрах 10-35
         #if DEBUG
         let frameInt = Int(frame)
-        if let name = layer.keypathName, name.contains("Media"), frameInt >= 10 && frameInt <= 35 {
+        let name = layer.keypathName
+        if name.contains("Media") && frameInt >= 10 && frameInt <= 35 {
             print("📍 [VISIBILITY] frame=\(frameInt) layer='\(name)' ip=\(ip) op=\(op)")
-            print("   layer.isHidden=\(layerHidden) contentsLayer.isHidden=\(contentsHidden)")
+            print("📍 [VISIBILITY]   layer.isHidden=\(layerHidden) contentsLayer.isHidden=\(contentsHidden)")
             let willSkipByIP = frame + 0.0001 < ip
             let willSkipByOP = frame >= op - 0.0001
-            print("   willSkipByIP=\(willSkipByIP) willSkipByOP=\(willSkipByOP)")
+            print("📍 [VISIBILITY]   willSkipByIP=\(willSkipByIP) willSkipByOP=\(willSkipByOP)")
         }
         #endif
 
@@ -505,15 +506,15 @@ public final class LottieOffscreenRenderer {
         let frameInt = Int(frame)
         if frameInt >= 0 && frameInt <= 50 {
             print("🔍 [MASK DIAG] frame=\(frameInt) layer='\(layer.keypathName ?? "?")'")
-            print("   isHidden=\(layer.contentsLayer.isHidden)")
-            print("   contentBounds=\(contentBounds) maskBounds=\(maskBounds)")
-            print("   cropRect=\(cropRect) requested=\(width)x\(height)")
-            print("   pooledContent=\(contentCtx.width)x\(contentCtx.height) pooledMask=\(maskCtx.width)x\(maskCtx.height)")
-            print("   fullMask=\(fullMask.width)x\(fullMask.height) croppedMask=\(maskImage.width)x\(maskImage.height)")
-            print("   destRect=\(destRect)")
+            print("🔍 [MASK DIAG]   isHidden=\(layer.contentsLayer.isHidden)")
+            print("🔍 [MASK DIAG]   contentBounds=\(contentBounds) maskBounds=\(maskBounds)")
+            print("🔍 [MASK DIAG]   cropRect=\(cropRect) requested=\(width)x\(height)")
+            print("🔍 [MASK DIAG]   pooledContent=\(contentCtx.width)x\(contentCtx.height) pooledMask=\(maskCtx.width)x\(maskCtx.height)")
+            print("🔍 [MASK DIAG]   fullMask=\(fullMask.width)x\(fullMask.height) croppedMask=\(maskImage.width)x\(maskImage.height)")
+            print("🔍 [MASK DIAG]   destRect=\(destRect)")
             for (i, m) in masks.enumerated() {
                 let pathBBox = m.path.boundingBoxOfPath
-                print("   mask[\(i)] mode=\(m.mode) opacity=\(m.opacity) inverted=\(m.inverted) pathBBox=\(pathBBox)")
+                print("🔍 [MASK DIAG]   mask[\(i)] mode=\(m.mode) opacity=\(m.opacity) inverted=\(m.inverted) pathBBox=\(pathBBox)")
             }
         }
         #endif

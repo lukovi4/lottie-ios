@@ -110,9 +110,17 @@ final class MaskContainerLayer: CALayer {
       guard let props = layer.properties,
             let path = layer.maskLayer.path else { return nil }
 
-      // Normalize opacity: Lottie stores as 0-100, we need 0-1
+      // Normalize opacity: Lottie ALWAYS stores mask opacity as 0-100, we need 0-1
+      // No heuristics - always divide by 100 and clamp to valid range
       let rawOpacity = props.opacity.value.cgFloatValue
-      let normalizedOpacity = rawOpacity > 1 ? rawOpacity / 100.0 : rawOpacity
+      let normalizedOpacity = max(0, min(1, rawOpacity / 100.0))
+
+      #if DEBUG
+      // Catch if opacity source format ever changes - this is an invariant
+      if rawOpacity > 0 && rawOpacity <= 1.0 {
+        assertionFailure("Mask opacity looks already normalized (0..1): \(rawOpacity). Source format changed or wrong property used.")
+      }
+      #endif
 
       return MaskSnapshot(
         path: path,
