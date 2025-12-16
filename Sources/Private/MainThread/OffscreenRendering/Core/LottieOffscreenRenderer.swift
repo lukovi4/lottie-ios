@@ -431,10 +431,30 @@ public final class LottieOffscreenRenderer {
         into cg: CGContext,
         state: RenderState
     ) {
-        // 1. Calculate crop bounds in layer's LOCAL space (content ∩ masks)
+        // 1. Calculate crop bounds in layer's LOCAL space
         let contentBounds = computeLayerLocalContentBounds(layer)
         let maskBounds = calculateMaskBounds(masks)
-        var cropRect = contentBounds.intersection(maskBounds)
+
+        // Determine if we need full content bounds (no intersection cropping)
+        // Subtract/Inverted masks show content OUTSIDE the mask shape,
+        // so cropping to maskBounds would discard the visible area.
+        let firstMask = masks[0]
+        let needsFullInitialCoverage = firstMask.mode == .subtract ||
+                                        firstMask.mode == .darken ||
+                                        firstMask.mode == .intersect ||
+                                        firstMask.mode == .difference ||
+                                        firstMask.inverted
+
+        let hasSubtractLike = masks.contains {
+            $0.mode == .subtract || $0.mode == .darken || ($0.mode == .intersect && $0.inverted)
+        }
+        let hasInvertedAdd = masks.contains {
+            ($0.mode == .add || $0.mode == .lighten) && $0.inverted
+        }
+
+        // Conservative: use full contentBounds when result may be outside mask shape
+        let needsFullBounds = needsFullInitialCoverage || hasSubtractLike || hasInvertedAdd
+        var cropRect = needsFullBounds ? contentBounds : contentBounds.intersection(maskBounds)
 
         // Guard against empty or invalid rect
         if cropRect.isNull || cropRect.isEmpty || cropRect.width < 1 || cropRect.height < 1 {
