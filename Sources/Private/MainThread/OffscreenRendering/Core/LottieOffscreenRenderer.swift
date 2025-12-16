@@ -526,18 +526,21 @@ public final class LottieOffscreenRenderer {
         ctx.fill(CGRect(origin: .zero, size: bufferSize))
 
         // Render each mask
+        // IMPORTANT: Grayscale context has no alpha channel (CGImageAlphaInfo.none),
+        // so we encode opacity directly into the gray value (0=masked, 1=visible).
+        // clip(to:mask:) uses pixel brightness as alpha.
         for mask in masks {
             switch mask.mode {
             case .add:
-                // Add mode: fill with white * opacity
-                ctx.setFillColor(gray: 1, alpha: mask.opacity)
+                // Add mode: gray = opacity (0% opacity → black, 100% → white)
+                ctx.setFillColor(gray: mask.opacity, alpha: 1)
                 ctx.addPath(mask.path)
                 ctx.fillPath(using: .evenOdd)
 
             case .subtract:
                 // Subtract: path already contains veryLargeRect with evenOdd
-                // Fill with black to subtract
-                ctx.setFillColor(gray: 0, alpha: mask.opacity)
+                // Fill with black to subtract (inverse of opacity)
+                ctx.setFillColor(gray: 1.0 - mask.opacity, alpha: 1)
                 ctx.addPath(mask.path)
                 ctx.fillPath(using: .evenOdd)
 
@@ -547,7 +550,7 @@ public final class LottieOffscreenRenderer {
                 #if DEBUG
                 print("⚠️ [LottieOffscreenRenderer] Intersect mask mode not fully implemented, treating as Add")
                 #endif
-                ctx.setFillColor(gray: 1, alpha: mask.opacity)
+                ctx.setFillColor(gray: mask.opacity, alpha: 1)
                 ctx.addPath(mask.path)
                 ctx.fillPath(using: .evenOdd)
 
