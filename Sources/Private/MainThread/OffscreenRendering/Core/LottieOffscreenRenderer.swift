@@ -435,26 +435,23 @@ public final class LottieOffscreenRenderer {
         let contentBounds = computeLayerLocalContentBounds(layer)
         let maskBounds = calculateMaskBounds(masks)
 
-        // Determine if we need full content bounds (no intersection cropping)
-        // Subtract/Inverted masks show content OUTSIDE the mask shape,
-        // so cropping to maskBounds would discard the visible area.
-        let firstMask = masks[0]
-        let needsFullInitialCoverage = firstMask.mode == .subtract ||
-                                        firstMask.mode == .darken ||
-                                        firstMask.mode == .intersect ||
-                                        firstMask.mode == .difference ||
-                                        firstMask.inverted
+        // Safety: if masks empty or bounds invalid, fall back to content bounds
+        var cropRect: CGRect
+        if masks.isEmpty || maskBounds.isNull || maskBounds.isEmpty {
+            cropRect = contentBounds
+        } else {
+            // These cases can reveal content OUTSIDE the shape area,
+            // so intersect-cropping would discard visible pixels.
+            let hasSubtractLike = masks.contains {
+                $0.mode == .subtract || $0.mode == .darken
+            }
+            let hasInvertedAddLike = masks.contains {
+                ($0.mode == .add || $0.mode == .lighten) && $0.inverted
+            }
 
-        let hasSubtractLike = masks.contains {
-            $0.mode == .subtract || $0.mode == .darken || ($0.mode == .intersect && $0.inverted)
+            let needsFullBounds = hasSubtractLike || hasInvertedAddLike
+            cropRect = needsFullBounds ? contentBounds : contentBounds.intersection(maskBounds)
         }
-        let hasInvertedAdd = masks.contains {
-            ($0.mode == .add || $0.mode == .lighten) && $0.inverted
-        }
-
-        // Conservative: use full contentBounds when result may be outside mask shape
-        let needsFullBounds = needsFullInitialCoverage || hasSubtractLike || hasInvertedAdd
-        var cropRect = needsFullBounds ? contentBounds : contentBounds.intersection(maskBounds)
 
         // Guard against empty or invalid rect
         if cropRect.isNull || cropRect.isEmpty || cropRect.width < 1 || cropRect.height < 1 {
