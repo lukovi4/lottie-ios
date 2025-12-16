@@ -78,14 +78,18 @@ public struct RenderContext {
     /// Accumulated render state (alpha, blend mode)
     public let state: RenderState
 
-    public init(cg: CGContext, state: RenderState = .identity) {
+    /// Current animation frame (for ip/op gating in nested layers)
+    public let frame: CGFloat
+
+    public init(cg: CGContext, state: RenderState = .identity, frame: CGFloat = 0) {
         self.cg = cg
         self.state = state
+        self.frame = frame
     }
 
     /// Convenience: creates context with updated alpha
     public func withOpacity(_ opacity: CGFloat) -> RenderContext {
-        RenderContext(cg: cg, state: state.withOpacity(opacity))
+        RenderContext(cg: cg, state: state.withOpacity(opacity), frame: frame)
     }
 
     /// Applies current state to CGContext (call before drawing)

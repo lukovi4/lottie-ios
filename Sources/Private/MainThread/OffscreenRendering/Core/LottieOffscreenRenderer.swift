@@ -183,7 +183,7 @@ public final class LottieOffscreenRenderer {
         // doesn't work correctly with bitmap contexts.
         let initialState = RenderState.identity
         for layer in animationLayers {
-            renderCompositionLayer(layer, into: ctx, state: initialState)
+            renderCompositionLayer(layer, frame: frame, into: ctx, state: initialState)
         }
 
         // Update metrics
@@ -205,13 +205,30 @@ public final class LottieOffscreenRenderer {
     /// We use RenderState to track accumulated alpha, NOT CGContext.alpha getter
     /// (which doesn't work correctly with bitmap contexts).
     ///
-    private func renderCompositionLayer(_ layer: CompositionLayer, into cg: CGContext, state: RenderState) {
-        guard !layer.isHidden else { return }
+    private func renderCompositionLayer(
+        _ layer: CompositionLayer,
+        frame: CGFloat,
+        into cg: CGContext,
+        state: RenderState
+    ) {
+        // 0) IP/OP gating — don't render layers outside their visibility range
+        let ip = layer.inFrame
+        let op = layer.outFrame
+        if op > ip {
+            let eps: CGFloat = 0.0001
+            if frame + eps < ip || frame >= op - eps { return }
+        } else {
+            // Broken timing data, skip layer
+            return
+        }
+
+        // 1) Runtime hidden check
+        guard !layer.contentsLayer.isHidden else { return }
 
         cg.saveGState()
         defer { cg.restoreGState() }
 
-        // 1. Apply global transform (position, scale, rotation, anchor, parent chain)
+        // 2. Apply global transform (position, scale, rotation, anchor, parent chain)
         let transform = layer.transformNode.globalTransform.affineTransform
         cg.concatenate(transform)
 
@@ -224,7 +241,7 @@ public final class LottieOffscreenRenderer {
         cg.setAlpha(layerState.alpha)
 
         // 4. Create RenderContext for this layer
-        let renderCtx = RenderContext(cg: cg, state: layerState)
+        let renderCtx = RenderContext(cg: cg, state: layerState, frame: frame)
 
         // 5. Check for masks - if present, use alpha-mask rendering
         if let maskContainer = layer.maskLayer {
@@ -237,7 +254,7 @@ public final class LottieOffscreenRenderer {
             }
             #endif
             if !masks.isEmpty {
-                renderLayerWithMask(layer, masks: masks, into: cg, state: layerState)
+                renderLayerWithMask(layer, masks: masks, frame: frame, into: cg, state: layerState)
                 return
             }
         }
@@ -391,6 +408,7 @@ public final class LottieOffscreenRenderer {
     private func renderLayerWithMask(
         _ layer: CompositionLayer,
         masks: [MaskSnapshot],
+        frame: CGFloat,
         into cg: CGContext,
         state: RenderState
     ) {
@@ -425,7 +443,7 @@ public final class LottieOffscreenRenderer {
               let maskCtx = contextPool.getGrayscale(width: width, height: height) else {
             // Fallback: render without mask if we can't get buffers
             print("⚠️ [LottieOffscreenRenderer] Failed to get context buffers for mask, rendering without mask")
-            let renderCtx = RenderContext(cg: cg, state: state)
+            let renderCtx = RenderContext(cg: cg, state: state, frame: frame)
             renderLayerContent(layer, ctx: renderCtx)
             return
         }
@@ -442,7 +460,7 @@ public final class LottieOffscreenRenderer {
         // 4. Render layer content into RGBA buffer
         // Create RenderContext with alpha=1.0 for offscreen, we'll apply layer alpha when compositing
         let offscreenState = RenderState(alpha: 1.0)
-        let contentRenderCtx = RenderContext(cg: contentCtx, state: offscreenState)
+        let contentRenderCtx = RenderContext(cg: contentCtx, state: offscreenState, frame: frame)
         renderLayerContent(layer, ctx: contentRenderCtx)
 
         // 5. Render masks into grayscale buffer
@@ -687,8 +705,9 @@ public final class LottieOffscreenRenderer {
     private func renderPrecompLayer(_ layer: PreCompositionLayer, ctx: RenderContext) {
         // PreCompositionLayer has its own animationLayers
         // Pass current RenderState.state so children inherit accumulated alpha
+        // Pass frame for ip/op gating on nested layers
         for childLayer in layer.animationLayers {
-            renderCompositionLayer(childLayer, into: ctx.cg, state: ctx.state)
+            renderCompositionLayer(childLayer, frame: ctx.frame, into: ctx.cg, state: ctx.state)
         }
     }
 
