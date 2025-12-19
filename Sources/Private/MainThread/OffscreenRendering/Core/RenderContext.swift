@@ -81,15 +81,40 @@ public struct RenderContext {
     /// Current animation frame (for ip/op gating in nested layers)
     public let frame: CGFloat
 
-    public init(cg: CGContext, state: RenderState = .identity, frame: CGFloat = 0) {
+    /// Size of the current rendering surface (bitmap context), if known.
+    /// Used for correct Y-flip calculations in cropped buffers.
+    public let surfaceSize: CGSize?
+
+    /// Transform from current coordinate space to world space.
+    /// - In world space (root): `.identity`
+    /// - Inside precomp/offscreen: accumulated parent transforms
+    ///
+    /// Used to calculate relative transforms for children.
+    /// See docs/offscreen_description.md for detailed explanation.
+    public let parentToWorld: CGAffineTransform
+
+    public init(
+        cg: CGContext,
+        state: RenderState = .identity,
+        frame: CGFloat = 0,
+        surfaceSize: CGSize? = nil,
+        parentToWorld: CGAffineTransform = .identity
+    ) {
         self.cg = cg
         self.state = state
         self.frame = frame
+        self.surfaceSize = surfaceSize
+        self.parentToWorld = parentToWorld
     }
 
     /// Convenience: creates context with updated alpha
     public func withOpacity(_ opacity: CGFloat) -> RenderContext {
-        RenderContext(cg: cg, state: state.withOpacity(opacity), frame: frame)
+        RenderContext(cg: cg, state: state.withOpacity(opacity), frame: frame, surfaceSize: surfaceSize, parentToWorld: parentToWorld)
+    }
+
+    /// Creates context with updated parentToWorld transform
+    public func withParentToWorld(_ transform: CGAffineTransform) -> RenderContext {
+        RenderContext(cg: cg, state: state, frame: frame, surfaceSize: surfaceSize, parentToWorld: transform)
     }
 
     /// Applies current state to CGContext (call before drawing)

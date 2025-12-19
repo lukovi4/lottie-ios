@@ -181,12 +181,14 @@ public final class LottieOffscreenRenderer {
         }
 
         // 4. Render all layers in correct order (unified traversal)
-        // CONTRACT: VideoGenerator provides context already flipped to UIKit coords (Y-down).
+        // CONTRACT: VideoGenerator provides context in Quartz Y-up (identity CTM).
         // NOTE: We use RenderState to track alpha because CGContext.alpha getter
         // doesn't work correctly with bitmap contexts.
         let initialState = RenderState.identity
+        let surfaceSize = CGSize(width: ctx.width, height: ctx.height)
+        let initialCtx = RenderContext(cg: ctx, state: initialState, frame: frame, surfaceSize: surfaceSize)
         for layer in animationLayers {
-            renderCompositionLayer(layer, frame: frame, into: ctx, state: initialState)
+            renderCompositionLayer(layer, ctx: initialCtx)
         }
 
         // Update metrics
@@ -208,16 +210,20 @@ public final class LottieOffscreenRenderer {
     /// We use RenderState to track accumulated alpha, NOT CGContext.alpha getter
     /// (which doesn't work correctly with bitmap contexts).
     ///
-    private func renderCompositionLayer(
-        _ layer: CompositionLayer,
-        frame: CGFloat,
-        into cg: CGContext,
-        state: RenderState
-    ) {
+    /// Renders a composition layer with proper coordinate space handling.
+    ///
+    /// Uses `ctx.parentToWorld` to calculate relative transforms:
+    /// - In world space (root): `parentToWorld = .identity` → uses globalTransform
+    /// - Inside precomp/offscreen: `parentToWorld = parent.global` → uses relative transform
+    ///
+    /// See docs/offscreen_description.md for detailed explanation.
+    ///
+    private func renderCompositionLayer(_ layer: CompositionLayer, ctx: RenderContext) {
         let ip = layer.inFrame
         let op = layer.outFrame
         let layerHidden = layer.isHidden
         let contentsHidden = layer.contentsLayer.isHidden
+        let frame = ctx.frame
 
         // DEBUG: Точечный лог для Media слоёв на кадрах 10-35
         #if DEBUG
@@ -244,25 +250,27 @@ public final class LottieOffscreenRenderer {
         // 1) Runtime hidden check (check BOTH layer and contentsLayer)
         guard !layerHidden && !contentsHidden else { return }
 
-        cg.saveGState()
-        defer { cg.restoreGState() }
+        ctx.cg.saveGState()
+        defer { ctx.cg.restoreGState() }
 
-        // 2. Apply global transform (position, scale, rotation, anchor, parent chain)
-        let transform = layer.transformNode.globalTransform.affineTransform
-        cg.concatenate(transform)
+        // 2. Calculate transform relative to parent coordinate space
+        // In world space (parentToWorld = .identity): layerTransform = globalTransform
+        // In offscreen buffer: layerTransform = relative to parent
+        //
+        // Math: child-local → world → parent-local
+        //   childGlobal: child-local → world
+        //   parentToWorld⁻¹: world → parent-local
+        // Result: parentToWorld⁻¹ × childGlobal
+        // In CGAffineTransform: A.concatenating(B) = B × A
+        // So: childGlobal.concatenating(parentToWorld⁻¹) = parentToWorld⁻¹ × childGlobal ✓
+        let layerGlobal = layer.transformNode.globalTransform.affineTransform
+        let layerTransform = layerGlobal.concatenating(ctx.parentToWorld.inverted())
 
-        // 2. Calculate layer alpha from RenderState (our source of truth)
-        // NEVER read from cg.alpha - it doesn't work with bitmap contexts!
+        // 3. Calculate layer alpha from RenderState (our source of truth)
         let layerOpacity = CGFloat(layer.transformNode.opacity)
-        let layerState = state.withOpacity(layerOpacity)
+        let layerState = ctx.state.withOpacity(layerOpacity)
 
-        // 3. Set alpha ABSOLUTE from our tracked state
-        cg.setAlpha(layerState.alpha)
-
-        // 4. Create RenderContext for this layer
-        let renderCtx = RenderContext(cg: cg, state: layerState, frame: frame)
-
-        // 5. Check for masks - if present, use alpha-mask rendering
+        // 4. Check for masks - if present, render with deferred transform
         if let maskContainer = layer.maskLayer {
             let masks = maskContainer.maskSnapshots()
             #if DEBUG
@@ -273,18 +281,41 @@ public final class LottieOffscreenRenderer {
             }
             #endif
             if !masks.isEmpty {
-                renderLayerWithMask(layer, masks: masks, frame: frame, into: cg, state: layerState)
+                // Pass layerTransform to renderLayerWithMask - it will apply at composite stage
+                renderLayerWithMask(
+                    layer,
+                    masks: masks,
+                    layerTransform: layerTransform,
+                    ctx: ctx,
+                    state: layerState
+                )
                 return
             }
         }
 
-        // 6. Render based on layer type (no mask)
+        // 5. No mask path: apply transform now and render content
+        ctx.cg.concatenate(layerTransform)
+        ctx.cg.setAlpha(layerState.alpha)
+        let childCtx = RenderContext(cg: ctx.cg, state: layerState, frame: frame, surfaceSize: ctx.surfaceSize, parentToWorld: ctx.parentToWorld)
+
         #if DEBUG
         if layer.keypathName.contains("Media") {
             print("🔴 [NO MASK] rendering '\(layer.keypathName)' WITHOUT mask!")
         }
         #endif
-        renderLayerContent(layer, ctx: renderCtx)
+        renderLayerContent(layer, ctx: childCtx)
+    }
+
+    /// Legacy wrapper for backward compatibility.
+    private func renderCompositionLayer(
+        _ layer: CompositionLayer,
+        frame: CGFloat,
+        into cg: CGContext,
+        state: RenderState
+    ) {
+        let surfaceSize = CGSize(width: cg.width, height: cg.height)
+        let ctx = RenderContext(cg: cg, state: state, frame: frame, surfaceSize: surfaceSize)
+        renderCompositionLayer(layer, ctx: ctx)
     }
 
     /// Renders layer content based on its type.
@@ -410,30 +441,35 @@ public final class LottieOffscreenRenderer {
     /// Renders a layer with alpha mask applied.
     ///
     /// ## Algorithm:
-    /// 1. Calculate cropRect = intersection of content bounds and mask bounds
-    /// 2. Render content into RGBA offscreen buffer (cropRect size)
-    /// 3. Render masks into grayscale buffer (white * opacity)
-    /// 4. Composite: clip(to: cropRect, mask: grayImage) + draw(rgbaImage)
+    /// 1. Calculate cropRect in layer-local coordinates
+    /// 2. Render content into RGBA offscreen buffer (identity CTM + translate by -cropOrigin)
+    /// 3. Render masks into grayscale buffer (same coordinate space)
+    /// 4. Composite into main ctx WITH layerTransform applied
+    ///
+    /// ## Key Principle:
+    /// Offscreen rendering (content + mask) always happens in layer-local coordinates.
+    /// layerTransform is applied ONLY at the final composite stage.
+    /// This matches CALayer pipeline behavior.
     ///
     /// ## Performance:
     /// - Uses ContextPool to reuse buffers
     /// - Bounds cropping avoids rendering full canvas for small masks
     ///
-    /// ## Important:
-    /// This method is called AFTER globalTransform is already applied to main context.
-    /// Content and mask are rendered in layer's LOCAL coordinate space (before transform).
-    /// The final composite is drawn into the already-transformed main context.
-    ///
     private func renderLayerWithMask(
         _ layer: CompositionLayer,
         masks: [MaskSnapshot],
-        frame: CGFloat,
-        into cg: CGContext,
+        layerTransform: CGAffineTransform,
+        ctx: RenderContext,
         state: RenderState
     ) {
+        let frame = ctx.frame
+        let cg = ctx.cg
+
         // 1. Calculate crop bounds in layer's LOCAL space
         let contentBounds = computeLayerLocalContentBounds(layer)
-        let maskBounds = calculateMaskBounds(masks)
+
+        // Calculate maskBounds in Quartz coordinates (same as contentBounds, no flip)
+        let maskBounds = calculateMaskBoundsRaw(masks)
 
         // Safety: if masks empty or bounds invalid, fall back to content bounds
         var cropRect: CGRect
@@ -449,7 +485,15 @@ public final class LottieOffscreenRenderer {
                 ($0.mode == .add || $0.mode == .lighten) && $0.inverted
             }
 
-            let needsFullBounds = hasSubtractLike || hasInvertedAddLike
+            // PreComp children are positioned anywhere within precomp bounds,
+            // not necessarily where the mask is. Must render full bounds,
+            // then let mask clip the result. Otherwise children outside
+            // cropRect would be clipped BEFORE mask is applied.
+            let isPrecomp = layer is PreCompositionLayer
+
+            // Subtract/inverted masks reveal content OUTSIDE the shape, need full bounds
+            // PreComp: children can be anywhere, must render all then mask clips
+            let needsFullBounds = hasSubtractLike || hasInvertedAddLike || isPrecomp
             cropRect = needsFullBounds ? contentBounds : contentBounds.intersection(maskBounds)
         }
 
@@ -466,30 +510,45 @@ public final class LottieOffscreenRenderer {
 
         // 2. Get content buffer from pool
         guard let contentCtx = contextPool.getRGBA(width: width, height: height) else {
-            // Fallback: render without mask
-            let renderCtx = RenderContext(cg: cg, state: state, frame: frame)
-            renderLayerContent(layer, ctx: renderCtx)
+            // Fallback: apply transform and render without mask
+            cg.saveGState()
+            cg.concatenate(layerTransform)
+            cg.setAlpha(state.alpha)
+            let fallbackCtx = RenderContext(cg: cg, state: state, frame: frame, surfaceSize: ctx.surfaceSize, parentToWorld: ctx.parentToWorld)
+            renderLayerContent(layer, ctx: fallbackCtx)
+            cg.restoreGState()
             return
         }
         defer { contextPool.release(contentCtx) }
 
         // 3. Render layer content into RGBA buffer
+        // Critical: map cropRect origin to buffer origin via translateBy
+        // This works for ALL layer types (image, shape, precomp) automatically
         contentCtx.saveGState()
-        contentCtx.translateBy(x: -cropRect.origin.x, y: -cropRect.origin.y)
+        contentCtx.translateBy(x: -cropRect.minX, y: -cropRect.minY)
+
+        print("🧩 [CROP] layer=\(layer.keypathName) cropRect=\(cropRect) bufferSize=\(width)x\(height) ctm=\(contentCtx.ctm)")
+
         let offscreenState = RenderState(alpha: 1.0)
-        let contentRenderCtx = RenderContext(cg: contentCtx, state: offscreenState, frame: frame)
+        let contentRenderCtx = RenderContext(
+            cg: contentCtx,
+            state: offscreenState,
+            frame: frame,
+            surfaceSize: CGSize(width: width, height: height)
+        )
         renderLayerContent(layer, ctx: contentRenderCtx)
         contentCtx.restoreGState()
 
-        // 4. Compose masks using pixel math (exact AE semantics)
-        let offset = CGPoint(x: -cropRect.origin.x, y: -cropRect.origin.y)
+        // 4. Compose masks using pixel math (Quartz coordinates)
+        // Same offset as content: translate mask paths into cropRect space
+        let offset = CGPoint(x: -cropRect.minX, y: -cropRect.minY)
         guard let maskImage = maskComposer.compose(masks: masks, width: width, height: height, offset: offset) else {
             // Fallback: render content without mask
             if let contentImage = contentCtx.makeImage()?.cropping(to: CGRect(x: 0, y: 0, width: width, height: height)) {
-                let destRect = CGRect(x: cropRect.origin.x, y: cropRect.origin.y, width: CGFloat(width), height: CGFloat(height))
                 cg.saveGState()
+                cg.concatenate(layerTransform)
                 cg.setAlpha(state.alpha)
-                cg.draw(contentImage, in: destRect)
+                cg.draw(contentImage, in: cropRect)
                 cg.restoreGState()
             }
             return
@@ -502,29 +561,28 @@ public final class LottieOffscreenRenderer {
             return
         }
 
-        // 6. Composite: clip with mask, then draw content
-        // clip(to:mask:) semantics: white (255) = visible, black (0) = hidden
-        let destRect = CGRect(x: cropRect.origin.x, y: cropRect.origin.y, width: CGFloat(width), height: CGFloat(height))
-
+        // 6. Composite into main ctx WITH layerTransform
+        // Apply transform only here - offscreen was rendered in layer-local space
+        // clip(to:mask:) semantics (Apple docs): white (255) = visible, black (0) = hidden
         cg.saveGState()
+        cg.concatenate(layerTransform)
         cg.setAlpha(state.alpha)
-        cg.clip(to: destRect, mask: maskImage)
-        cg.draw(contentImage, in: destRect)
+
+        print("🧭 [CLIP CTM] \(cg.ctm) cropRect=\(cropRect)")
+
+        cg.clip(to: cropRect, mask: maskImage)
+        cg.draw(contentImage, in: cropRect)
         cg.restoreGState()
     }
 
-    /// Calculates the bounding box of all masks combined.
-    /// Uses shapeBounds (original shape before veryLargeRect inversion) instead of path.boundingBox
-    /// which would be huge for subtract masks and break cropping optimization.
-    private func calculateMaskBounds(_ masks: [MaskSnapshot]) -> CGRect {
+    /// Calculates mask bounds in Quartz coordinates (no flip).
+    /// All offscreen rendering happens in Quartz Y-up, so no coordinate conversion needed.
+    private func calculateMaskBoundsRaw(_ masks: [MaskSnapshot]) -> CGRect {
         var bounds = CGRect.null
         for mask in masks {
-            // Use shapeBounds which is the original shape bbox, NOT path.boundingBox
-            // path may contain veryLargeRect for subtract/inverted masks
-            let shapeBounds = mask.shapeBounds
-            if !shapeBounds.isNull && !shapeBounds.isEmpty {
-                bounds = bounds.isNull ? shapeBounds : bounds.union(shapeBounds)
-            }
+            let bb = mask.shapePath.boundingBoxOfPath
+            if bb.isNull || bb.isEmpty { continue }
+            bounds = bounds.isNull ? bb : bounds.union(bb)
         }
         return bounds
     }
@@ -567,8 +625,10 @@ public final class LottieOffscreenRenderer {
             ctx.cg.saveGState()
 
             // Apply layer's own transform if any
-            if !renderLayer.affineTransform().isIdentity {
-                ctx.cg.concatenate(renderLayer.affineTransform())
+            // Cache transform to avoid multiple calls
+            let t = renderLayer.affineTransform()
+            if !t.isIdentity {
+                ctx.cg.concatenate(t)
             }
 
             // Call renderOffscreen directly on renderer for proper alpha handling
@@ -587,12 +647,13 @@ public final class LottieOffscreenRenderer {
                 }
             }
 
-            ctx.cg.restoreGState()
-
-            // Recurse into nested containers (safe type check)
+            // P0-1 FIX: Recurse into nested containers INSIDE gState block
+            // so child transforms accumulate correctly with parent transform
             if let childContainer = renderLayer as? ShapeContainerLayer {
                 renderShapeContainer(childContainer, ctx: ctx)
             }
+
+            ctx.cg.restoreGState()
         }
     }
 
@@ -642,29 +703,27 @@ public final class LottieOffscreenRenderer {
     private func renderImageLayer(_ layer: ImageCompositionLayer, ctx: RenderContext) {
         guard let image = layer.image else { return }
 
-        let bounds = layer.contentsLayer.bounds
-        drawPixelBufferImage(image, inSlot: bounds, ctx: ctx)
+        let slot = layer.contentsLayer.bounds
+        drawPixelBufferImage(image, inSlot: slot, ctx: ctx)
     }
 
-    /// Draws a CGImage from pixel buffer into a slot with correct orientation.
+    /// Draws a CGImage into a slot.
     ///
-    /// Pixel-buffer images (video frames, photos from CVPixelBuffer) have origin
-    /// at bottom-left. This helper applies local Y-flip to draw correctly in
-    /// UIKit coordinate context without copying pixels.
+    /// ## No Flip Needed
+    /// Providers return normalized CGImages (Quartz-ready):
+    /// - Photo (FilepathImageProvider): UIImage normalized via UIGraphics
+    /// - Video (StreamingVideoImageProvider): UIGraphics context with transform
     ///
-    /// - Note: Alpha is already set in CGContext from RenderState before this call.
-    /// - Note: If mask/matte applies to slot content, clip should be inside this flip.
+    /// translateBy on contentCtx handles cropping for all layer types.
     ///
     private func drawPixelBufferImage(_ image: CGImage, inSlot bounds: CGRect, ctx: RenderContext) {
         ctx.cg.saveGState()
         defer { ctx.cg.restoreGState() }
 
-        // Alpha is already set from RenderState in renderCompositionLayer
-        // No need to set it again here
-
-        // Apply local Y-flip for pixel-buffer images
-        ctx.cg.translateBy(x: 0, y: bounds.height)
+        // Переводим CGImage (UIKit-ориентированный) в Quartz Y-up ТОЛЬКО в пределах slot
+        ctx.cg.translateBy(x: bounds.origin.x, y: bounds.origin.y + bounds.height)
         ctx.cg.scaleBy(x: 1, y: -1)
+
         ctx.cg.draw(image, in: CGRect(origin: .zero, size: bounds.size))
     }
 
@@ -681,10 +740,32 @@ public final class LottieOffscreenRenderer {
     ///
     private func renderPrecompLayer(_ layer: PreCompositionLayer, ctx: RenderContext) {
         // PreCompositionLayer has its own animationLayers
-        // Pass current RenderState.state so children inherit accumulated alpha
-        // Pass frame for ip/op gating on nested layers
+        // Children inherit accumulated alpha via RenderState
+        //
+        // CRITICAL: Children's globalTransform is already in PRECOMP-LOCAL space!
+        // Lottie computes child.globalTransform relative to the precomp composition,
+        // NOT relative to world. So we must use .identity for parentToWorld,
+        // allowing children to use their globalTransform directly.
+        //
+        // The precomp's own world transform is applied at composite stage
+        // in renderLayerWithMask (cg.concatenate(layerTransform)).
+
+        let childCtx = ctx.withParentToWorld(.identity)
+
+        #if DEBUG
+        print("🎬 [Precomp] rendering '\(layer.keypathName ?? "?")' children=\(layer.animationLayers.count)")
+        print("🎬 [Precomp] precompGlobal=\(layer.transformNode.globalTransform.affineTransform) (applied at composite)")
+        for (i, child) in layer.animationLayers.enumerated() {
+            let childGlobal = child.transformNode.globalTransform.affineTransform
+            print("🎬   [\(i)] '\(child.keypathName ?? "?")' globalInPrecomp=\(childGlobal)")
+            if let imgLayer = child as? ImageCompositionLayer {
+                print("🎬   [\(i)] bounds=\(imgLayer.contentsLayer.bounds) hasImage=\(imgLayer.image != nil)")
+            }
+        }
+        #endif
+
         for childLayer in layer.animationLayers {
-            renderCompositionLayer(childLayer, frame: ctx.frame, into: ctx.cg, state: ctx.state)
+            renderCompositionLayer(childLayer, ctx: childCtx)
         }
     }
 

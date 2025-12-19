@@ -44,21 +44,38 @@ public class FilepathImageProvider: AnimationImageProvider {
       let data = try? Data(contentsOf: url),
       let image = UIImage(data: data)
     {
-      return image.cgImage
+      return normalizedCGImage(from: image)
     }
 
     let directPath = filepath.appendingPathComponent(asset.name).path
-    if FileManager.default.fileExists(atPath: directPath) {
-      return UIImage(contentsOfFile: directPath)?.cgImage
+    if FileManager.default.fileExists(atPath: directPath),
+       let uiImage = UIImage(contentsOfFile: directPath) {
+      return normalizedCGImage(from: uiImage)
     }
 
     let pathWithDirectory = filepath.appendingPathComponent(asset.directory).appendingPathComponent(asset.name).path
-    if FileManager.default.fileExists(atPath: pathWithDirectory) {
-      return UIImage(contentsOfFile: pathWithDirectory)?.cgImage
+    if FileManager.default.fileExists(atPath: pathWithDirectory),
+       let uiImage = UIImage(contentsOfFile: pathWithDirectory) {
+      return normalizedCGImage(from: uiImage)
     }
 
     LottieLogger.shared.warn("Could not find image \"\(asset.name)\" in bundle")
     return nil
+  }
+
+  // MARK: Private
+
+  /// Normalizes UIImage orientation by rendering through UIGraphics context.
+  /// UIImage.cgImage returns raw pixels without applying imageOrientation.
+  /// This ensures the CGImage has correct pixel orientation for direct drawing.
+  private func normalizedCGImage(from uiImage: UIImage) -> CGImage? {
+    let size = uiImage.size
+    UIGraphicsBeginImageContextWithOptions(size, false, 1.0)
+    defer { UIGraphicsEndImageContext() }
+
+    uiImage.draw(in: CGRect(origin: .zero, size: size))
+
+    return UIGraphicsGetImageFromCurrentImageContext()?.cgImage
   }
 
   public func contentsGravity(for _: ImageAsset) -> CALayerContentsGravity {

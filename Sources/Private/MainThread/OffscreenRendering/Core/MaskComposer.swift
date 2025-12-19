@@ -10,22 +10,28 @@
 //
 
 import CoreGraphics
+import ImageIO
 
 // MARK: - MaskComposer
 
 /// Composes multiple masks into a single coverage buffer using pixel math.
 ///
-/// ## Key Principle: Coverage = Luminance
+/// ## Key Principle: clip(to:mask:) semantics
 /// We use DeviceGray (1 byte per pixel, no alpha) for masks.
-/// - 0 (black) = fully hidden
-/// - 255 (white) = fully visible
+/// Apple's clip(to:mask:) uses mask sample value as alpha:
+/// - 255 (white) = fully VISIBLE
+/// - 0 (black) = fully HIDDEN
 /// - opacity is encoded in gray value, NOT alpha
 ///
 /// ## Mask Mode Math (equivalent to After Effects)
-/// - **Add**: `dst = max(dst, src)`
-/// - **Subtract**: `dst = dst * (1 - src) / 255`
-/// - **Intersect**: `dst = min(dst, src)`
+/// - **Add**: `dst = max(dst, src)` - union, reveal shape area
+/// - **Subtract**: `dst = dst * (255 - src) / 255` - hide shape area
+/// - **Intersect**: `dst = min(dst, src)` - keep only intersection
 /// - **Inverted**: `src = 255 - src` (applied before mode)
+///
+/// ## Initial Accumulator Value
+/// - Add mode: start with 0 (all hidden), Add reveals shapes
+/// - Subtract/Intersect: start with 255 (all visible), then reduce
 ///
 /// ## Why Pixel Math Instead of CGBlendMode
 /// - CGBlendMode behavior with grayscale contexts is undefined/inconsistent
@@ -40,8 +46,10 @@ public final class MaskComposer {
 
     // MARK: - Properties
 
-    /// Accumulator buffer (dst) - reused between compose() calls
-    private var accBuffer: [UInt8] = []
+    /// Accumulator buffer (dst) - stable pointer for no-copy CGDataProvider
+    /// P0-2: Using UnsafeMutablePointer instead of [UInt8] to avoid Data copy
+    private var accPtr: UnsafeMutablePointer<UInt8>?
+    private var accCapacity: Int = 0
 
     /// Source buffer for single mask - reused between masks
     private var srcBuffer: [UInt8] = []
@@ -56,6 +64,10 @@ public final class MaskComposer {
     // MARK: - Initialization
 
     public init() {}
+
+    deinit {
+        accPtr?.deallocate()
+    }
 
     // MARK: - Public API
 
@@ -78,31 +90,34 @@ public final class MaskComposer {
         // Ensure buffers are allocated/resized
         ensureBuffers(width: width, height: height)
 
-        // Determine initial coverage based on first mask
-        let first = masks[0]
-        let needsFullInitial = first.mode == .subtract ||
-                               first.mode == .darken ||
-                               first.mode == .intersect ||
-                               first.mode == .difference ||
-                               first.inverted
+        // clip(to:mask:) semantics (Apple docs):
+        // - WHITE (255) = VISIBLE (mask sample used as alpha)
+        // - BLACK (0) = HIDDEN (clipped)
+        //
+        // So our coverage buffer: 255 = show content, 0 = hide content
 
-        // Initialize accumulator
-        if needsFullInitial {
-            // Start with full coverage (white)
-            accBuffer.withUnsafeMutableBytes { ptr in
-                memset(ptr.baseAddress, 255, width * height)
-            }
-        } else {
-            // Start with zero coverage (black)
-            accBuffer.withUnsafeMutableBytes { ptr in
-                memset(ptr.baseAddress, 0, width * height)
-            }
+        // Initialize accumulator (P0-2: using stable pointer)
+        guard let acc = accPtr else { return nil }
+        let size = width * height
+
+        // Neutral element depends ONLY on the first operation
+        // - add/lighten: start from 0 (empty coverage), then max(0, s) = s
+        // - subtract/darken/intersect/difference: start from 255 (full coverage)
+        // - none: start from 255 (same as "no mask")
+        let first = masks[0]
+        let initial: UInt8
+        switch first.mode {
+        case .add, .lighten:
+            initial = 0
+        case .subtract, .darken, .intersect, .difference, .none:
+            initial = 255
         }
+        memset(acc, Int32(initial), size)
 
         // Compose each mask
         for mask in masks {
             renderMaskToSrcBuffer(mask, offset: offset)
-            composeCoverage(mode: mask.mode, inverted: mask.inverted)
+            composeCoverage(mode: mask.mode, inverted: mask.inverted, opacity: mask.opacity)
         }
 
         // Create CGImage from accumulator
@@ -111,7 +126,9 @@ public final class MaskComposer {
 
     /// Clears cached buffers. Call after export to free memory.
     public func clearCaches() {
-        accBuffer = []
+        accPtr?.deallocate()
+        accPtr = nil
+        accCapacity = 0
         srcBuffer = []
         srcContext = nil
         bufferWidth = 0
@@ -121,13 +138,20 @@ public final class MaskComposer {
     // MARK: - Private: Buffer Management
 
     /// Ensures buffers are allocated with correct size.
+    /// P0-2: accPtr uses stable UnsafeMutablePointer for no-copy CGDataProvider
     private func ensureBuffers(width: Int, height: Int) {
-        let size = width * height
+        let needed = width * height
 
-        // Reallocate if size changed
+        // Reallocate accPtr if capacity insufficient
+        if needed > accCapacity {
+            accPtr?.deallocate()
+            accPtr = .allocate(capacity: needed)
+            accCapacity = needed
+        }
+
+        // Reallocate srcBuffer and srcContext if dimensions changed
         if bufferWidth != width || bufferHeight != height {
-            accBuffer = [UInt8](repeating: 0, count: size)
-            srcBuffer = [UInt8](repeating: 0, count: size)
+            srcBuffer = [UInt8](repeating: 0, count: needed)
             srcContext = nil // Force recreation
             bufferWidth = width
             bufferHeight = height
@@ -146,6 +170,9 @@ public final class MaskComposer {
                     bitmapInfo: CGImageAlphaInfo.none.rawValue
                 )
             }
+            // Enable antialiasing for smooth mask edges
+            srcContext?.setShouldAntialias(true)
+            srcContext?.setAllowsAntialiasing(true)
         }
     }
 
@@ -163,12 +190,12 @@ public final class MaskComposer {
         ctx.saveGState()
         defer { ctx.restoreGState() }
 
-        // Apply offset (typically -cropRect.origin)
+        // Offscreen = Quartz coordinates (Y-up), only offset needed
+        // Must match contentCtx transform order in renderLayerWithMask
         ctx.translateBy(x: offset.x, y: offset.y)
 
-        // Draw shape with opacity encoded as gray value
-        // gray = opacity means: 0 = transparent, 1 = opaque coverage
-        ctx.setFillColor(CGColor(gray: mask.opacity, alpha: 1))
+        // Draw shape as full white (opacity applied in composeCoverage)
+        ctx.setFillColor(CGColor(gray: 1.0, alpha: 1.0))
         ctx.addPath(mask.shapePath)
         ctx.fillPath(using: mask.fillRule)
     }
@@ -177,52 +204,86 @@ public final class MaskComposer {
 
     /// Composes srcBuffer into accBuffer using pixel math.
     ///
-    /// This is the core of mask composition - exact AE semantics:
-    /// - Add: max(dst, src)
-    /// - Subtract: dst * (1 - src) / 255
-    /// - Intersect: min(dst, src)
-    private func composeCoverage(mode: MaskMode, inverted: Bool) {
+    /// clip(to:mask:) semantics (Apple docs):
+    /// - 255 (white) = VISIBLE
+    /// - 0 (black) = HIDDEN
+    ///
+    /// srcBuffer contains shape coverage: 255 inside shape, 0 outside
+    /// accPtr is our accumulated mask: 255 = visible, 0 = hidden
+    ///
+    /// After Effects mask modes:
+    /// - Add: union - reveal shape area (increase coverage)
+    /// - Subtract: difference - hide shape area (decrease coverage)
+    /// - Intersect: intersection - keep only where both are visible
+    private func composeCoverage(mode: MaskMode, inverted: Bool, opacity: CGFloat) {
+        guard let acc = accPtr else { return }
         let count = bufferWidth * bufferHeight
 
-        for i in 0..<count {
-            var s = Int(srcBuffer[i])
+        // Clamp and convert opacity to 0-255 range
+        let o = Int((max(0, min(1, opacity)) * 255.0).rounded())
 
-            // Apply inversion first
+        for i in 0..<count {
+            var s = Int(srcBuffer[i])  // src = shape coverage (255 inside, 0 outside)
+
+            // Apply inversion first (in shape space)
             if inverted {
                 s = 255 - s
             }
 
-            let d = Int(accBuffer[i])
+            // Apply mask opacity as multiplier
+            s = (s * o) / 255
+
+            let d = Int(acc[i])  // dst = accumulated coverage (255=visible, 0=hidden)
 
             let result: Int
             switch mode {
             case .add, .lighten:
-                // Union: max(dst, src)
+                // Add: union of masks - take maximum coverage
+                // Inside shape (s=255): max(d, 255) = 255 (visible)
+                // Outside shape (s=0): max(d, 0) = d (unchanged)
                 result = max(d, s)
 
             case .subtract, .darken:
-                // Remove: dst * (1 - src/255) = dst * (255 - src) / 255
+                // Subtract: multiplicatively cut out shape from accumulated coverage
+                // Standard coverage compositing formula (Lottie/AE-like model)
+                // Inside shape (s=255): d * (255 - 255) / 255 = 0 (hidden)
+                // Outside shape (s=0): d * (255 - 0) / 255 = d (unchanged)
+                // Works correctly with antialiasing and opacity
                 result = (d * (255 - s)) / 255
 
-            case .intersect, .difference:
-                // Intersection: min(dst, src)
+            case .intersect:
+                // Intersect: keep only where BOTH are visible
+                // min(dst, src)
+                // Inside shape (s=255): min(d, 255) = d
+                // Outside shape (s=0): min(d, 0) = 0 (hidden)
                 result = min(d, s)
 
+            case .difference:
+                // Difference: XOR-like coverage (where one but not both are visible)
+                // abs(dst - src)
+                result = abs(d - s)
+
             case .none:
-                // Skip this mask
                 result = d
             }
 
-            accBuffer[i] = UInt8(clamping: result)
+            acc[i] = UInt8(clamping: result)
         }
     }
 
     // MARK: - Private: Image Creation
 
     /// Creates a CGImage from the accumulator buffer.
+    /// Uses a copy of the data to avoid lifetime issues when compose() is called again.
     private func createImageFromAccumulator(width: Int, height: Int) -> CGImage? {
-        // Create data provider from accumulator
-        guard let provider = CGDataProvider(data: Data(accBuffer) as CFData) else {
+        guard let acc = accPtr else { return nil }
+        let size = width * height
+
+        // Create a copy of accumulator data for CGImage
+        // This ensures the CGImage remains valid even if compose() is called again
+        // (which would overwrite accPtr with new data)
+        let data = Data(bytes: acc, count: size) as CFData
+        guard let provider = CGDataProvider(data: data) else {
             return nil
         }
 
